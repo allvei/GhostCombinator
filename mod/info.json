@@ -1,9 +1,9 @@
 {
   "name": "ghost-combinator",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "title": "Ghost Combinator",
   "author": "Gordon Palumbo",
-  "factorio_version": "2.0",
-  "dependencies": ["base >= 2.0.0", "flib >= 0.16.0"],
+  "factorio_version": "2.1",
+  "dependencies": ["base >= 2.1.0", "flib >= 0.17.2"],
   "description": "Ghost Combinator - Track construction ghosts with circuit signals"
 }
