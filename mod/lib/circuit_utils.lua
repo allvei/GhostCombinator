@@ -320,12 +320,13 @@ end
 
 --- Get the total count of a specific signal from input wires
 --- @param entity LuaEntity
---- @param signal_id SignalID The signal to count {type, name}
+--- @param signal_id SignalID The signal to count {type, name, quality?}
 --- @param wire_type defines.wire_type|nil Optional wire type filter
 --- @return integer Total count of the signal
 ---
 --- This searches for a specific signal across input wires and returns its summed count.
 --- Different from get_unique_signal_count which counts how many different signals exist.
+--- In Factorio 2.0, signals also have quality (defaults to "normal")
 function circuit_utils.get_signal_count(entity, signal_id, wire_type)
   if not entity or not entity.valid or not signal_id then
     return 0
@@ -333,11 +334,13 @@ function circuit_utils.get_signal_count(entity, signal_id, wire_type)
 
   local total = 0
   local signals = circuit_utils.get_input_signals_raw(entity, wire_type)
+  local target_quality = signal_id.quality or "normal"
 
   -- Sum from red wire
   if not wire_type or wire_type == defines.wire_type.red then
     for _, signal_data in ipairs(signals.red) do
-      if signal_data.signal.type == signal_id.type and signal_data.signal.name == signal_id.name then
+      local sig_quality = signal_data.signal.quality or "normal"
+      if signal_data.signal.type == signal_id.type and signal_data.signal.name == signal_id.name and sig_quality == target_quality then
         total = total + signal_data.count
       end
     end
@@ -346,7 +349,8 @@ function circuit_utils.get_signal_count(entity, signal_id, wire_type)
   -- Sum from green wire
   if not wire_type or wire_type == defines.wire_type.green then
     for _, signal_data in ipairs(signals.green) do
-      if signal_data.signal.type == signal_id.type and signal_data.signal.name == signal_id.name then
+      local sig_quality = signal_data.signal.quality or "normal"
+      if signal_data.signal.type == signal_id.type and signal_data.signal.name == signal_id.name and sig_quality == target_quality then
         total = total + signal_data.count
       end
     end

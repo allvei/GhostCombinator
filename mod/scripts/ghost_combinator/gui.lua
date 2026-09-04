@@ -1,6 +1,6 @@
--- Mission Control Mod - Ghost Combinator GUI
+-- Ghost Combinator Mod - Ghost Combinator GUI
 -- This module handles the GUI for ghost combinator entity
--- Shows read-only ghost counts as circuit signals
+-- Shows the selected category's counts as circuit signals, plus a mode selector
 
 local flib_gui = require("__flib__.gui")
 local gui_entity = require("lib.gui.gui_entity")
@@ -8,6 +8,9 @@ local gui_circuit_inputs = require("lib.gui.gui_circuit_inputs")
 local entity_lib = require("lib.entity_lib")
 local globals = require("scripts.globals")
 local gc_storage = require("scripts.ghost_combinator.storage")
+local gc_config = require("scripts.ghost_combinator.config")
+-- Safe one-way dependency: control does not require gui, so there is no cycle.
+local gc_control = require("scripts.ghost_combinator.control")
 
 local gui = {}
 
@@ -17,35 +20,39 @@ local GHOST_COMBINATOR = "ghost-combinator"
 -- GUI element names
 local GUI_FRAME_NAME = "ghost_combinator_gui"
 
---- Get ghost data for a surface
---- @param surface_index number The surface index
---- @return table|nil Ghost data for the surface
-local function get_ghost_data(surface_index)
-    if not storage.ghost_combinator then
-        return nil
-    end
+-- GUI element name for the output mode selector
+local MODE_DROPDOWN_NAME = "ghost_combinator_mode_dropdown"
 
-    return storage.ghost_combinator[surface_index]
+--- Build the localised captions for the mode dropdown, in CATEGORIES order
+--- @return table Array of LocalisedString captions
+local function mode_dropdown_items()
+    local items = {}
+    for _, mode in ipairs(gc_storage.CATEGORIES) do
+        items[#items + 1] = {"gui.ghost-combinator-mode-" .. mode}
+    end
+    return items
 end
 
---- Convert ghost data to signal format for GUI display
+--- Convert one category's entries to the signal format the grid expects
+--- Reads through the storage accessor rather than touching storage directly -
+--- see docs/module_responsibility_matrix.md.
 --- @param surface_index number The surface index
+--- @param category string The category to display
 --- @return table Array of signals in format {signal = SignalID, count = int}
-local function get_ghost_signals(surface_index)
+local function get_category_signals(surface_index, category)
     local signals = {}
-    local ghost_data = get_ghost_data(surface_index)
 
-    if not ghost_data or not ghost_data.ghosts then
+    local entries = gc_storage.get_entries(surface_index, category)
+    if not entries then
         return signals
     end
 
-    -- Convert to signal format expected by gui_circuit_inputs
-    for _, ghost_info in pairs(ghost_data.ghosts) do
-        if ghost_info and ghost_info.count > 0 and ghost_info.item_name then
+    for _, entry in pairs(entries) do
+        if entry and entry.count > 0 and entry.item_name then
             -- Use "item" signal type with the resolved item name
             table.insert(signals, {
-                signal = { type = "item", name = ghost_info.item_name, quality = ghost_info.quality },
-                count = ghost_info.count
+                signal = { type = "item", name = entry.item_name, quality = entry.quality },
+                count = entry.count
             })
         end
     end
@@ -53,7 +60,7 @@ local function get_ghost_signals(surface_index)
     return signals
 end
 
---- Create signal grid display for ghost counts using shared gui_circuit_inputs
+--- Create signal grid display for the combinator's selected category
 --- @param parent LuaGuiElement Parent element to add grid to
 --- @param entity LuaEntity The ghost combinator entity
 local function create_signal_grid(parent, entity)
@@ -62,7 +69,8 @@ local function create_signal_grid(parent, entity)
     end
 
     local surface_index = entity.surface.index
-    local signals = get_ghost_signals(surface_index)
+    local mode = gc_config.get_mode(entity)
+    local signals = get_category_signals(surface_index, mode)
 
     -- Use shared signal sub-grid from gui_circuit_inputs (no wire color for output display)
     return gui_circuit_inputs.create_signal_sub_grid(parent, signals, "none", "ghost_signal_grid")
@@ -192,6 +200,37 @@ function gui.create_gui(player, entity)
                             }
                         }
                     },
+                    -- Output mode selector
+                    {
+                        type = "flow",
+                        direction = "horizontal",
+                        style_mods = {
+                            vertical_align = "center",
+                            bottom_margin = 8
+                        },
+                        children = {
+                            {
+                                type = "label",
+                                caption = {"gui.ghost-combinator-mode-header"},
+                                tooltip = {"gui.ghost-combinator-mode-tooltip"},
+                                style_mods = {
+                                    font = "default-semibold",
+                                    right_margin = 4
+                                }
+                            },
+                            {
+                                type = "drop-down",
+                                name = MODE_DROPDOWN_NAME,
+                                items = mode_dropdown_items(),
+                                selected_index = gc_storage.mode_to_index(gc_config.get_mode(entity)),
+                                tooltip = {"gui.ghost-combinator-mode-tooltip"},
+                                tags = { action = "set_mode" },
+                                style_mods = {
+                                    minimal_width = 140
+                                }
+                            }
+                        }
+                    },
                     -- Signal section header
                     {
                         type = "flow",
@@ -262,12 +301,18 @@ function gui.close_gui(player)
     end
 
     local frame = player.gui.screen[GUI_FRAME_NAME]
+
+    -- Capture BEFORE destroying: once frame.destroy() runs, the engine has
+    -- already nulled player.opened and `frame` is invalid, so comparing them
+    -- afterwards is always false and the reset below never fires.
+    local was_opened = (frame and frame.valid and player.opened == frame)
+
     if frame and frame.valid then
         frame.destroy()
     end
 
     -- Clear the opened GUI reference
-    if player.opened == frame then
+    if was_opened then
         player.opened = nil
     end
 
@@ -364,6 +409,47 @@ end
 function gui.on_gui_checked_state_changed(event)
     -- Ghost combinator GUI has no checkboxes, this is a no-op
     -- Kept for consistency with event registration in control.lua
+end
+
+--- Handle dropdown selection changes - the output mode selector
+--- Dispatches on element.tags.action, matching the family's GUI idiom.
+--- @param event EventData.on_gui_selection_state_changed
+function gui.on_gui_selection_state_changed(event)
+    local element = event.element
+    if not element or not element.valid then return end
+
+    local tags = element.tags
+    if not tags or tags.action ~= "set_mode" then return end
+
+    local player = game.get_player(event.player_index)
+    if not player then return end
+
+    local player_gui_state = globals.get_player_gui_state(player.index)
+    if not player_gui_state then
+        gui.close_gui(player)
+        return
+    end
+
+    local entity = player_gui_state.open_entity
+    if not entity or not entity.valid then
+        gui.close_gui(player)
+        return
+    end
+
+    local mode = gc_storage.index_to_mode(element.selected_index)
+
+    if gc_config.set_mode(entity, mode) then
+        -- Slot numbering is per-category, so the combinator's existing output is
+        -- meaningless for the new mode. Rebuild it wholesale rather than waiting
+        -- for the incremental tick pass, which only writes *changed* entries and
+        -- would leave the old category's values sitting in the section.
+        if not entity_lib.is_ghost(entity) then
+            gc_control.refresh_combinator(entity, mode)
+        end
+    end
+
+    -- Repaint the signal grid for the newly selected category
+    gui.refresh_gui(player)
 end
 
 return gui

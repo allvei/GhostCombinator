@@ -1,6 +1,6 @@
 # Ghost Combinator
 
-A Factorio 2.0 mod that outputs circuit signals for all construction ghosts on a surface.
+A Factorio 2.1 mod that outputs circuit signals for all construction ghosts on a surface.
 
 ## What It Does
 
@@ -23,5 +23,7 @@ The combinator automatically tracks all ghosts on the same surface. Place ghosts
 ## Notes
 
 - One combinator covers an entire surface (Nauvis, Vulcanus, platforms, etc.)
+- Entities that share a placement item are merged into one signal (rails report as `rail`)
 - Signals compress automatically - zero-count entries are cleaned up every 5 seconds
 - Ghosts placed before installing the mod are not tracked
+- Upgrade requests and tile ghosts (landfill, concrete, platform foundation) are not yet tracked

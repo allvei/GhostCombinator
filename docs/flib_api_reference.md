@@ -1,10 +1,12 @@
 # FLib API Reference
-## Mission Control Mod - Quick Reference Guide
+## Ghost Combinator Mod - Quick Reference Guide
 
-Version: 0.16.5
-Source: `flib_0.16.5/`
+Documented against: flib 0.16.5 (`flib_0.16.5/`)
 
-This document provides a comprehensive reference for all FLib (Factorio Library) functions used in the Mission Control mod. FLib is a collection of common utilities and helpers for Factorio mod development.
+> ⚠️ `mod/info.json` declares `flib >= 0.17.2`. This reference was written against 0.16.5, so
+> verify any signature here against the installed flib before relying on it.
+
+This document provides a comprehensive reference for all FLib (Factorio Library) functions used in the Ghost Combinator mod. FLib is a collection of common utilities and helpers for Factorio mod development.
 
 ---
 

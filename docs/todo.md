@@ -1,30 +1,98 @@
-# Mission Control Mod - Development TODO
+# Ghost Combinator — Development TODO
+
+Index of active work. Detailed per-feature plans live in `docs/<feature>_todo.md` and are
+linked from here.
 
 ## Current Status
-Ghost Combinator implementation complete and ready for testing.
 
-## Completed Features
+Entity-ghost tracking is implemented end to end (v0.2.0) and ready for in-game testing.
 
-### Ghost Combinator (v0.1.0)
-- [x] Entity prototype (1x1 constant combinator base, 1kW power)
+## Completed
+
+### Ghost Combinator core (v0.1.0 – v0.2.0)
+- [x] Entity prototype (1x1 constant-combinator base, unpowered)
 - [x] Item and recipe definitions
-- [x] Technology unlock (500x science packs)
-- [x] Ghost tracking logic (increment/decrement on build/remove)
-- [x] Combinator signal output via LuaLogisticSection API
-- [x] Read-only GUI displaying ghost counts
-- [x] Per-surface tracking (independent ghost lists per surface)
-- [x] Slot compaction (every 5 seconds, removes zero-count entries)
-- [x] Locale strings (EN)
+- [x] Technology unlock
+- [x] Ghost tracking (increment on build, decrement via `on_object_destroyed`)
+- [x] Signal output via `LuaLogisticSection` (`get_section` / `set_slot` / `clear_slot`)
+- [x] Item-name resolution through `items_to_place_this` (so `straight-rail` → `rail`)
+- [x] Per-quality tracking
+- [x] Read-only GUI showing ghost counts, with pipette support
+- [x] Per-surface tracking
+- [x] Slot compaction every 5s, full resync every 10s
+- [x] EN locale strings
+- [x] Custom entity sprite + icon
+- [x] Debug commands (`/gc-ghost-state`, `/gc-ghost-clear`)
 
-## Pending / Future Work
-- [x] Custom graphics (entity sprite + icon from mod/graphics/entities/)
-- [ ] Integration testing with blueprints
-- [ ] Performance profiling with large ghost counts
-- [ ] Multi-surface testing (Nauvis, Vulcanus, platforms)
+## Open Work
 
-## Entity-Specific TODOs
-- See: docs/ghost_combinator_todo.md (if detailed tracking needed)
+### Correctness
+- [ ] **Technology cost is dev values.** `prototypes/technology/technologies.lua` ships
+      `unit.count = 5, unit.time = 3`. Spec intent is 500 cycles at 30s. Decide and fix.
+- [ ] **Locale mod-name key mismatch.** `locale/en/ghost-combinator.cfg` has
+      `[mod-name] mission-control=` / `[mod-description] mission-control=`, but `info.json`
+      declares `name = "ghost-combinator"`, so neither string resolves. Rename both keys.
+- [ ] **Stale "Mission Control" headers** in `mod/data.lua`, `mod/lib/gui/gui_entity.lua`,
+      `mod/lib/gui/gui_circuit_inputs.lua`, `mod/scripts/ghost_combinator/gui.lua`,
+      `mod/prototypes/technology/technologies.lua`, and the `Makefile` banner.
+- [ ] **Dead references in `lib/circuit_utils.lua` header** — points at a `validation.lua` that
+      does not exist in this project.
+- [ ] **1.1-era API in `lib/circuit_utils.lua`.** `has_circuit_connection` /
+      `has_any_circuit_connection` use `defines.circuit_connector_id` (removed in 2.0, replaced
+      by `defines.wire_connector_id`) and the 1.1 two-arg `get_circuit_network(wire, connector)`.
+      Currently unreachable — nothing outside the lib calls them — so latent, not a live crash.
+      Delete or port. Detail in the feature plan, §8.
+
+### Coverage — untracked construction demand
+The combinator only counts `entity-ghost`. These are invisible to it today:
+- [ ] Upgrade requests (`on_marked_for_upgrade` / `on_cancelled_upgrade`)
+- [ ] Tile ghosts (`type == "tile-ghost"`) — landfill, all concrete variants, stone brick,
+      space platform foundation, and the Space Age soils/platforms
+- [ ] Deconstruction orders — out of scope for now; they *produce* items rather than requiring
+      them, so they'd invert the meaning of the signal
+
+**Feature plan: [docs/construction_demand_tracking_todo.md](construction_demand_tracking_todo.md)**
+(APIs verified against Factorio 2.1.14 / api_version 6)
+
+### Space platform events — likely bug
+- [ ] `mod/control.lua` never registers `on_space_platform_built_entity` or
+      `on_space_platform_mined_entity`. A ghost combinator built by a space platform is never
+      registered in storage and outputs nothing. Details in the feature plan above, §4.
+
+### Upstream fixes for `../FactorioBaseMod` (affect the whole mod family)
+- [ ] **`lib/gui_utils.lua:134` uses `utility/close_white`, which does not exist in Factorio 2.x.**
+      Verified against `wube/factorio-data` `core/prototypes/utility-sprites.lua`: the key is
+      `close` (line 2694); `close_white` is a 1.1 name. Assigning a nonexistent sprite raises
+      `Sprite 'utility/close_white' does not exist`, so **any call to `create_titlebar` crashes**.
+      Latent today — `create_titlebar` and `create_status_label` have zero callers anywhere in
+      the family. Fix in the base mod and re-sync, rather than diverging in one mod.
+      (`utility/warning_icon` at :36 was also flagged but is **valid** — it exists at line 836.)
+- [ ] `lib/gui_utils.lua` `create_status_label` concatenates its `status_text` parameter, which
+      is documented as a `LocalisedString`; passing the documented type throws. Build a
+      localised caption (`{"", icon, " ", status_text}`) instead.
+- [ ] `lib/gui_utils.lua` declares ~17 functions as globals rather than locals.
+- [ ] Family-wide `defines.circuit_connector_id` / `get_merged_signals` 1.1 leftovers in
+      `lib/circuit_utils.lua` (unreachable in all four mods).
+- [ ] Backport this mod's better `lib/gui/gui_entity.lua` (uses `entity.status` + locale keys).
+
+### Code health
+- [x] Split the per-instance config concern out of `storage.lua` into
+      `scripts/ghost_combinator/config.lua`. All modules now within the 750–900 line limit.
+- [ ] **No Lua toolchain on this machine** — `lua`, `luac`, `luacheck` and `luarocks` are all
+      absent, so `make lint` cannot run and nothing has been compiled. Static checks used
+      instead: cross-module call resolution, and a block/delimiter balance pass. Install
+      luacheck before trusting any of this in game.
+
+### Testing & Performance
+- [ ] Integration testing with blueprints (place/cancel large blueprints)
+- [ ] Performance profiling with large ghost counts (10k+ ghosts)
+- [ ] Multi-surface testing (Nauvis, other planets, space platforms)
+- [ ] Save/load round-trip verification
+- [ ] Multiplayer desync check
 
 ## Known Limitations
-1. **Bootstrap Problem**: Ghosts placed before mod installation are not tracked
-2. **Signal Type**: Uses "item" signal type - entities without matching item names may show placeholder icon
+
+1. **Bootstrap** — ghosts placed before the mod was installed are never counted; there is no
+   startup scan of existing ghosts.
+2. **Signal type** — output is always `type = "item"`. Entities without `items_to_place_this`
+   fall back to their entity name, which may not be a valid item signal.

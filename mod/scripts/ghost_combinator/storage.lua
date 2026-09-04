@@ -1,63 +1,251 @@
 -- Ghost Combinator - Storage Module
--- Manages ghost tracking data per surface and combinator registration
--- CRITICAL: Uses Factorio 2.0 APIs - storage NOT global!
+-- Manages per-surface, per-category demand counters and combinator registration
+-- CRITICAL: Uses Factorio 2.0+ APIs - storage NOT global!
 --
--- Storage Structure:
+-- ============================================================================
+-- STORAGE STRUCTURE
+-- ============================================================================
 -- storage.ghost_combinator = {
 --     [surface_index] = {
---         combinators = { [unit_number] = entity, ... },
---         ghosts = {
---             ["item_name:quality"] = {    -- Key is item_name:quality (not entity_name)
---                 count = N,
---                 slot = M,
---                 changed = true/false,
---                 item_name = "item_name",  -- Item name for signal output (looked up from entity)
---                 quality = "quality_name"  -- Quality for signal
---             },
+--         categories = {
+--             builds   = CATEGORY,  -- entity-ghost      (default mode)
+--             tiles    = CATEGORY,  -- tile-ghost
+--             upgrades = CATEGORY,  -- entities marked for upgrade
 --         },
---         any_changes = false,
---         next_slot = 1,
---         last_compact_tick = 0,  -- Track when we last compacted slots
---         slot_high_water = 0    -- Highest slot ever assigned (for resync orphan clearing)
+--         combinators = {
+--             [unit_number] = { entity = LuaEntity, mode = "builds" },
+--         },
+--         last_compact_tick = 0,
 --     }
 -- }
--- NOTE: Entity names don't always match item names (e.g., "straight-rail" -> "rail")
--- Multiple entity types may map to the same item, so they share a slot.
+--
+-- CATEGORY = {
+--     entries = {
+--         ["<item_name>:<quality>"] = {
+--             count     = N,
+--             slot      = M,          -- logistic section slot index
+--             changed   = true/false, -- dirty flag, drives incremental writes
+--             item_name = "iron-chest",
+--             quality   = "normal",
+--         },
+--     },
+--     dirty           = false,  -- category-level dirty flag
+--     next_slot       = 1,
+--     slot_high_water = 0,      -- highest slot ever assigned (bounds orphan clearing)
+-- }
+--
+-- WHY PER-CATEGORY SLOTS: every combinator writes ONE category into its logistic
+-- section, numbered 1..N from that category's entries. Two combinators in different
+-- modes therefore need independent slot spaces. Only `entries`, `dirty`, `next_slot`
+-- and `slot_high_water` are per-category - the combinator list and compaction
+-- timestamp stay surface-level, and every function below is parameterized by
+-- category rather than duplicated.
+--
+-- KEYED BY ITEM, NOT ENTITY: entity names don't always match item names
+-- (e.g. "straight-rail" -> "rail", tile "stone-path" -> item "stone-brick").
+-- Callers resolve the placing item via signal_utils BEFORE calling increment/
+-- decrement, so this module performs no prototype lookups on the hot path.
 --
 -- storage.ghost_registrations = {
---     [registration_number] = {surface_index, ghost_name, quality_name}
+--     [registration_number] = {
+--         surface   = surface_index,
+--         category  = "builds" | "tiles" | "upgrades",
+--         item_name = "iron-chest",  -- resolved at register time
+--         quality   = "normal",
+--     }
 -- }
--- Used to track ghosts registered with register_on_object_destroyed
+-- Tracks objects registered with script.register_on_object_destroyed so the
+-- decrement knows what to undo without re-resolving prototypes.
 
-local circuit_utils = require("lib.circuit_utils")
-local signal_utils = require("lib.signal_utils")
+local entity_lib = require("lib.entity_lib")
 
 local gc_storage = {}
 
 -- Entity name constant
 local GHOST_COMBINATOR = "ghost-combinator"
 
+-- Blueprint/ghost tag key. Follows the FactorioBaseMod convention of
+-- "<entity_name>_config" so it cannot collide with other mods' tags.
+local CONFIG_TAG = "ghost_combinator_config"
+gc_storage.CONFIG_TAG = CONFIG_TAG
+
+--------------------------------------------------------------------------------
+-- Categories
+--------------------------------------------------------------------------------
+
+--- Ordered list of output categories. Order drives GUI dropdown index <-> mode.
+--- Bound locally and re-exported, matching the family's constant style - these
+--- are read on the increment/decrement hot path, so they must not cost a table
+--- indirection through the module table on every call.
+local CATEGORIES = {"builds", "tiles", "upgrades"}
+gc_storage.CATEGORIES = CATEGORIES
+
+--- Default mode for new and migrated combinators.
+--- CRITICAL: must stay "builds" - that reproduces the pre-mode behavior exactly,
+--- so updating an existing save never silently changes what a combinator reports.
+local DEFAULT_MODE = "builds"
+gc_storage.DEFAULT_MODE = DEFAULT_MODE
+
+local VALID_MODES = {builds = true, tiles = true, upgrades = true}
+
+--- Check whether a string is a valid output mode
+--- @param mode string|nil The mode to validate
+--- @return boolean True if the mode is one of the known categories
+function gc_storage.is_valid_mode(mode)
+    return mode ~= nil and VALID_MODES[mode] == true
+end
+
+--- Convert a mode to its index in CATEGORIES (for GUI dropdowns)
+--- @param mode string The mode name
+--- @return number The 1-based index, defaulting to the DEFAULT_MODE index
+function gc_storage.mode_to_index(mode)
+    for index, name in ipairs(CATEGORIES) do
+        if name == mode then
+            return index
+        end
+    end
+    return 1  -- CATEGORIES[1] is DEFAULT_MODE
+end
+
+--- Convert a GUI dropdown index back to a mode name
+--- @param index number The 1-based dropdown index
+--- @return string The mode name, defaulting to DEFAULT_MODE
+function gc_storage.index_to_mode(index)
+    return CATEGORIES[index] or DEFAULT_MODE
+end
+
+--- Build an empty category record
+--- @return table A fresh CATEGORY table
+local function new_category()
+    return {
+        entries = {},
+        dirty = false,
+        next_slot = 1,
+        slot_high_water = 0
+    }
+end
+
 --------------------------------------------------------------------------------
 -- Storage Initialization
 --------------------------------------------------------------------------------
 
---- Initialize ghost combinator storage table
+--- Initialize ghost combinator storage tables
 --- Called during on_init and on_configuration_changed events
 function gc_storage.init_storage()
     storage.ghost_combinator = storage.ghost_combinator or {}
     storage.ghost_registrations = storage.ghost_registrations or {}
+    storage.pending_ghost_upgrades = storage.pending_ghost_upgrades or {}
 end
 
 --------------------------------------------------------------------------------
--- Surface Data Management
+-- Pending Ghost Upgrades
+--------------------------------------------------------------------------------
+-- Upgrading a ghost destroys it and creates a replacement. The destruction is
+-- observable (on_object_destroyed), but the replacement may not raise a build
+-- event, which would leave it permanently uncounted. We record the position at
+-- upgrade time and re-check it on the next tick.
+
+--- Queue a position to re-check for an untracked ghost next tick
+--- @param surface_index number The surface index
+--- @param position MapPosition Where the upgraded ghost was
+function gc_storage.queue_pending_ghost(surface_index, position)
+    if not surface_index or not position then
+        return
+    end
+
+    if not storage.pending_ghost_upgrades then
+        storage.pending_ghost_upgrades = {}
+    end
+
+    storage.pending_ghost_upgrades[#storage.pending_ghost_upgrades + 1] = {
+        surface = surface_index,
+        position = {x = position.x, y = position.y}
+    }
+end
+
+--- Take and clear the pending queue
+--- @return table Array of {surface, position} (empty if none)
+function gc_storage.take_pending_ghosts()
+    local pending = storage.pending_ghost_upgrades
+    if not pending or #pending == 0 then
+        return {}
+    end
+
+    storage.pending_ghost_upgrades = {}
+    return pending
+end
+
+--------------------------------------------------------------------------------
+-- Surface / Category Access
 --------------------------------------------------------------------------------
 
---- Get or create surface data table
+--- Bring a surface record up to the current schema, in place
+--- Handles records written by the pre-category version of this mod:
+---   * combinators[unit_number] was a bare LuaEntity, now {entity, mode}
+---   * counters lived in surface_data.ghosts at surface level
+--- CRITICAL: without the combinator conversion, `record.mode` on a bare
+--- LuaEntity raises "LuaEntity doesn't contain key mode" - a hard crash the
+--- first time an old save opens the GUI or runs cleanup.
+--- @param surface_data table The surface record to upgrade
+local function ensure_schema(surface_data)
+    surface_data.categories = surface_data.categories or {}
+    surface_data.combinators = surface_data.combinators or {}
+
+    for _, category in ipairs(CATEGORIES) do
+        if not surface_data.categories[category] then
+            surface_data.categories[category] = new_category()
+        end
+    end
+
+    -- Legacy combinator values were bare LuaEntity references
+    for unit_number, record in pairs(surface_data.combinators) do
+        if type(record) ~= "table" then
+            surface_data.combinators[unit_number] = {
+                entity = record,
+                mode = DEFAULT_MODE
+            }
+        end
+    end
+
+    -- Drop orphaned pre-category fields. The counts they held are rebuilt from
+    -- world truth by the rescan, so carrying them forward would only leave two
+    -- competing schemas in the save.
+    if surface_data.ghosts ~= nil then
+        surface_data.ghosts = nil
+        surface_data.any_changes = nil
+        surface_data.next_slot = nil
+        surface_data.slot_high_water = nil
+    end
+end
+
+--- Look up surface data WITHOUT creating it
+--- Read paths must use this: creating on read would resurrect records for
+--- deleted surfaces (a destroyed space platform still has queued
+--- on_object_destroyed events), and inserting a new key while a caller iterates
+--- storage.ghost_combinator raises "invalid key to 'next'".
 --- @param surface_index number The surface index
---- @return table Surface data table
+--- @return table|nil Surface data table, or nil if it does not exist
+local function peek_surface_data(surface_index)
+    if not surface_index or not storage.ghost_combinator then
+        return nil
+    end
+
+    local surface_data = storage.ghost_combinator[surface_index]
+    if not surface_data then
+        return nil
+    end
+
+    ensure_schema(surface_data)
+    return surface_data
+end
+
+--- Get or create surface data, ensuring all categories exist
+--- Only write paths (increment, register_combinator) should create.
+--- @param surface_index number The surface index
+--- @return table|nil Surface data table, or nil if surface_index is missing
 function gc_storage.get_surface_data(surface_index)
     if not surface_index then
-        game.print("[ERROR] get_surface_data called with nil surface_index")
+        log("[ghost_combinator] ERROR: get_surface_data called with nil surface_index")
         return nil
     end
 
@@ -65,19 +253,57 @@ function gc_storage.get_surface_data(surface_index)
         gc_storage.init_storage()
     end
 
-    -- Create surface data if it doesn't exist
-    if not storage.ghost_combinator[surface_index] then
-        storage.ghost_combinator[surface_index] = {
+    local surface_data = storage.ghost_combinator[surface_index]
+
+    if not surface_data then
+        surface_data = {
+            categories = {},
             combinators = {},
-            ghosts = {},
-            any_changes = false,
-            next_slot = 1,
-            last_compact_tick = 0,
-            slot_high_water = 0  -- Highest slot ever assigned (for resync orphan clearing)
+            last_compact_tick = 0
         }
+        storage.ghost_combinator[surface_index] = surface_data
     end
 
-    return storage.ghost_combinator[surface_index]
+    ensure_schema(surface_data)
+
+    return surface_data
+end
+
+--- Discard a surface's data entirely (surface deleted/cleared)
+--- @param surface_index number The surface index
+function gc_storage.drop_surface(surface_index)
+    if not surface_index or not storage.ghost_combinator then
+        return
+    end
+
+    storage.ghost_combinator[surface_index] = nil
+
+    -- Purge registrations pointing at the dead surface so they cannot decrement
+    -- into a resurrected record later.
+    if storage.ghost_registrations then
+        for registration_number, record in pairs(storage.ghost_registrations) do
+            if record.surface == surface_index then
+                storage.ghost_registrations[registration_number] = nil
+            end
+        end
+    end
+end
+
+--- Get a specific category record for a surface, WITHOUT creating it
+--- @param surface_index number The surface index
+--- @param category string One of CATEGORIES
+--- @return table|nil The CATEGORY table, or nil if it does not exist
+function gc_storage.get_category(surface_index, category)
+    if not VALID_MODES[category] then
+        return nil
+    end
+
+    local surface_data = peek_surface_data(surface_index)
+    if not surface_data then
+        return nil
+    end
+
+    return surface_data.categories[category]
 end
 
 --------------------------------------------------------------------------------
@@ -85,54 +311,71 @@ end
 --------------------------------------------------------------------------------
 
 --- Register a ghost combinator entity in storage
---- CRITICAL: Only register real entities, NEVER ghosts!
+--- CRITICAL: Only register real entities, NEVER ghosts! Ghosts carry their config
+--- in entity.tags instead (see save_ghost_config).
 --- @param entity LuaEntity The combinator entity to register
---- @return boolean True if registration succeeded
-function gc_storage.register_combinator(entity)
+--- @param mode string|nil Output mode; defaults to DEFAULT_MODE
+--- @return table|nil The combinator record, or nil if registration failed
+function gc_storage.register_combinator(entity, mode)
     if not entity or not entity.valid then
-        game.print("[ERROR] Attempted to register invalid ghost combinator")
-        return false
+        log("[ghost_combinator] ERROR: Attempted to register invalid ghost combinator")
+        return nil
     end
 
-    if entity.type == "entity-ghost" then
-        game.print("[ERROR] Attempted to register ghost entity - only real entities allowed!")
-        return false
+    if entity_lib.is_ghost(entity) then
+        log("[ghost_combinator] ERROR: Attempted to register ghost entity - ghosts use entity.tags, not storage!")
+        return nil
     end
 
-    if entity.name ~= GHOST_COMBINATOR then
-        game.print("[ERROR] Attempted to register non-ghost-combinator entity: " .. entity.name)
-        return false
+    if not entity_lib.is_type(entity, GHOST_COMBINATOR) then
+        log("[ghost_combinator] ERROR: Attempted to register non-ghost-combinator entity: " .. tostring(entity.name))
+        return nil
     end
 
     local unit_number = entity.unit_number
     if not unit_number then
-        game.print("[ERROR] Ghost combinator has no unit_number")
-        return false
+        log("[ghost_combinator] ERROR: Ghost combinator has no unit_number")
+        return nil
     end
 
     local surface_index = entity.surface.index
     local surface_data = gc_storage.get_surface_data(surface_index)
-
     if not surface_data then
-        return false
+        return nil
     end
 
-    -- Register the combinator
-    surface_data.combinators[unit_number] = entity
+    local existing = surface_data.combinators[unit_number]
 
-    -- Mark that we need to update this combinator with current ghost data
-    surface_data.any_changes = true
+    if not gc_storage.is_valid_mode(mode) then
+        -- No explicit mode: keep whatever this combinator already had. Build-ish
+        -- events can fire more than once for one entity (another mod raising
+        -- script_raised_built, or a re-register after restore_config), and
+        -- defaulting here would silently revert a player-configured combinator
+        -- back to "builds".
+        mode = (existing and existing.mode) or DEFAULT_MODE
+    end
 
-    return true
+    local record = {
+        entity = entity,
+        mode = mode
+    }
+    surface_data.combinators[unit_number] = record
+
+    -- Mark the combinator's category dirty so the next tick populates it.
+    local category = surface_data.categories[mode]
+    if category then
+        category.dirty = true
+    end
+
+    return record
 end
 
 --- Unregister a ghost combinator from storage
---- Called when entity is destroyed/removed
 --- @param unit_number number The unit_number of the entity to unregister
 --- @param surface_index number The surface index
 function gc_storage.unregister_combinator(unit_number, surface_index)
     if not unit_number or not surface_index then
-        game.print("[ERROR] Attempted to unregister combinator with nil unit_number or surface_index")
+        log("[ghost_combinator] ERROR: unregister_combinator called with nil unit_number or surface_index")
         return
     end
 
@@ -141,190 +384,206 @@ function gc_storage.unregister_combinator(unit_number, surface_index)
     end
 
     local surface_data = storage.ghost_combinator[surface_index]
-    if not surface_data then
+    if not surface_data or not surface_data.combinators then
         return
     end
 
     surface_data.combinators[unit_number] = nil
 end
 
---------------------------------------------------------------------------------
--- Ghost Tracking Functions
---------------------------------------------------------------------------------
-
---- Increment ghost count for a specific ghost type and quality
---- CRITICAL: This is called for EVERY ghost built - must be FAST!
---- @param surface_index number The surface index
---- @param ghost_name string The ghost entity name
---- @param quality_name string The quality name (e.g., "normal", "uncommon", "rare", "epic", "legendary")
-function gc_storage.increment_ghost(surface_index, ghost_name, quality_name)
-    if not surface_index or not ghost_name then
-        return
-    end
-
-    quality_name = quality_name or "normal"
-
-    local surface_data = gc_storage.get_surface_data(surface_index)
-    if not surface_data then
-        return
-    end
-
-    -- Look up the item name that places this entity
-    -- Entity names don't always match item names (e.g., "straight-rail" -> "rail")
-    -- Multiple entity types may map to the same item (e.g., straight-rail, curved-rail -> rail)
-    local item_name = signal_utils.get_item_name_for_entity(ghost_name)
-
-    -- Use "item_name:quality" as key so entities sharing an item are combined
-    local ghost_key = item_name .. ":" .. quality_name
-    local ghost_entry = surface_data.ghosts[ghost_key]
-
-    if ghost_entry then
-        -- Increment existing ghost
-        ghost_entry.count = ghost_entry.count + 1
-        ghost_entry.changed = true
-    else
-        -- New ghost type - assign next available slot
-        local slot = surface_data.next_slot
-        surface_data.ghosts[ghost_key] = {
-            count = 1,
-            slot = slot,
-            changed = true,
-            item_name = item_name,  -- Store item name for signal output
-            quality = quality_name  -- Store quality for signal
-        }
-        surface_data.next_slot = slot + 1
-
-        -- Track highest slot ever assigned (for resync orphan clearing)
-        if slot > (surface_data.slot_high_water or 0) then
-            surface_data.slot_high_water = slot
-        end
-    end
-
-    surface_data.any_changes = true
-end
-
---- Decrement ghost count for a specific ghost type and quality
---- CRITICAL: This is called for EVERY ghost removed - must be FAST!
---- @param surface_index number The surface index
---- @param ghost_name string The ghost entity name
---- @param quality_name string The quality name
-function gc_storage.decrement_ghost(surface_index, ghost_name, quality_name)
-    if not surface_index or not ghost_name then
-        return
-    end
-
-    quality_name = quality_name or "normal"
-
-    local surface_data = gc_storage.get_surface_data(surface_index)
-    if not surface_data then
-        return
-    end
-
-    -- Look up the item name that places this entity (must match increment_ghost)
-    local item_name = signal_utils.get_item_name_for_entity(ghost_name)
-
-    -- Use "item_name:quality" as key (must match increment_ghost)
-    local ghost_key = item_name .. ":" .. quality_name
-    local ghost_entry = surface_data.ghosts[ghost_key]
-
-    if ghost_entry then
-        ghost_entry.count = math.max(0, ghost_entry.count - 1)
-        ghost_entry.changed = true
-        surface_data.any_changes = true
-    end
-end
-
---- Get all ghost counts for a surface (for GUI display)
---- @param surface_index number The surface index
---- @return table|nil Table of ghost_name -> {count, slot} or nil
-function gc_storage.get_ghost_counts(surface_index)
-    if not surface_index then
+--- Get the combinator record for a real entity
+--- @param entity LuaEntity The combinator entity
+--- @return table|nil The {entity, mode} record, or nil if not registered
+function gc_storage.get_combinator_record(entity)
+    if not entity or not entity.valid or entity_lib.is_ghost(entity) then
         return nil
     end
 
-    local surface_data = storage.ghost_combinator and storage.ghost_combinator[surface_index]
-    if not surface_data then
+    local unit_number = entity.unit_number
+    if not unit_number then
+        return nil
+    end
+
+    if not storage.ghost_combinator then
+        return nil
+    end
+
+    local surface_data = storage.ghost_combinator[entity.surface.index]
+    if not surface_data or not surface_data.combinators then
+        return nil
+    end
+
+    return surface_data.combinators[unit_number]
+end
+
+--- Get all combinator records for a surface
+--- @param surface_index number The surface index
+--- @return table Table of unit_number -> {entity, mode} (empty table if none)
+function gc_storage.get_combinators(surface_index)
+    if not surface_index or not storage.ghost_combinator then
         return {}
     end
 
-    return surface_data.ghosts
-end
-
---- Get all combinators for a surface
---- @param surface_index number The surface index
---- @return table|nil Table of unit_number -> entity or nil
-function gc_storage.get_combinators(surface_index)
-    if not surface_index then
-        return nil
-    end
-
-    local surface_data = storage.ghost_combinator and storage.ghost_combinator[surface_index]
-    if not surface_data then
+    local surface_data = storage.ghost_combinator[surface_index]
+    if not surface_data or not surface_data.combinators then
         return {}
     end
 
     return surface_data.combinators
 end
+--------------------------------------------------------------------------------
+-- Demand Counters
+--------------------------------------------------------------------------------
 
---- Check if surface has pending changes
+--- Build the storage key for an item/quality pair
+--- @param item_name string The placing item name
+--- @param quality_name string The quality name
+--- @return string The entry key
+local function entry_key(item_name, quality_name)
+    return item_name .. ":" .. quality_name
+end
+
+--- Increment the demand count for an item in a category
+--- CRITICAL: Called for EVERY ghost built - must be FAST!
+--- The caller must have already resolved item_name via signal_utils; this
+--- function performs no prototype lookups.
 --- @param surface_index number The surface index
+--- @param category string One of CATEGORIES
+--- @param item_name string The resolved placing item name
+--- @param quality_name string|nil The quality name (defaults to "normal")
+function gc_storage.increment(surface_index, category, item_name, quality_name)
+    if not surface_index or not item_name then
+        return
+    end
+
+    -- FAST PATH: one table index, no validation, no category loop. This runs for
+    -- every ghost built anywhere on the map (a 10k-entity blueprint means 10k
+    -- calls), so it must not funnel through get_surface_data's ensure logic.
+    local surface_data = storage.ghost_combinator and storage.ghost_combinator[surface_index]
+    local cat = surface_data and surface_data.categories and surface_data.categories[category]
+
+    if not cat then
+        -- Slow path only when the record or category is genuinely missing
+        if not VALID_MODES[category] then
+            return
+        end
+        surface_data = gc_storage.get_surface_data(surface_index)
+        cat = surface_data and surface_data.categories[category]
+        if not cat then
+            return
+        end
+    end
+
+    quality_name = quality_name or "normal"
+    local key = entry_key(item_name, quality_name)
+    local entry = cat.entries[key]
+
+    if entry then
+        entry.count = entry.count + 1
+        entry.changed = true
+    else
+        local slot = cat.next_slot
+        cat.entries[key] = {
+            count = 1,
+            slot = slot,
+            changed = true,
+            item_name = item_name,
+            quality = quality_name
+        }
+        cat.next_slot = slot + 1
+
+        if slot > cat.slot_high_water then
+            cat.slot_high_water = slot
+        end
+    end
+
+    cat.dirty = true
+end
+
+--- Decrement the demand count for an item in a category
+--- CRITICAL: Called for EVERY ghost removed - must be FAST!
+--- @param surface_index number The surface index
+--- @param category string One of CATEGORIES
+--- @param item_name string The resolved placing item name
+--- @param quality_name string|nil The quality name (defaults to "normal")
+function gc_storage.decrement(surface_index, category, item_name, quality_name)
+    if not surface_index or not item_name then
+        return
+    end
+
+    -- FAST PATH, and deliberately non-creating: a decrement for a surface with
+    -- no record (e.g. a deleted space platform whose destroy events are still
+    -- queued) has nothing to undo and must not resurrect the record.
+    local surface_data = storage.ghost_combinator and storage.ghost_combinator[surface_index]
+    local cat = surface_data and surface_data.categories and surface_data.categories[category]
+    if not cat then
+        return
+    end
+
+    quality_name = quality_name or "normal"
+    local entry = cat.entries[entry_key(item_name, quality_name)]
+
+    if entry then
+        entry.count = math.max(0, entry.count - 1)
+        entry.changed = true
+        cat.dirty = true
+    end
+end
+
+--- Get all entries for a category (for GUI display and output writing)
+--- @param surface_index number The surface index
+--- @param category string One of CATEGORIES
+--- @return table Table of key -> entry (empty table if none)
+function gc_storage.get_entries(surface_index, category)
+    local cat = gc_storage.get_category(surface_index, category)
+    if not cat then
+        return {}
+    end
+    return cat.entries
+end
+
+--- Check whether a category has pending changes
+--- @param surface_index number The surface index
+--- @param category string One of CATEGORIES
 --- @return boolean True if there are pending changes
-function gc_storage.has_changes(surface_index)
-    if not surface_index then
-        return false
-    end
-
-    local surface_data = storage.ghost_combinator and storage.ghost_combinator[surface_index]
-    if not surface_data then
-        return false
-    end
-
-    return surface_data.any_changes
+function gc_storage.is_dirty(surface_index, category)
+    local cat = gc_storage.get_category(surface_index, category)
+    return cat ~= nil and cat.dirty == true
 end
 
---- Clear the any_changes flag for a surface
+--- Clear the dirty flag for a category
 --- @param surface_index number The surface index
-function gc_storage.clear_changes_flag(surface_index)
-    if not surface_index then
-        return
-    end
-
-    local surface_data = storage.ghost_combinator and storage.ghost_combinator[surface_index]
-    if surface_data then
-        surface_data.any_changes = false
+--- @param category string One of CATEGORIES
+function gc_storage.clear_dirty(surface_index, category)
+    local cat = gc_storage.get_category(surface_index, category)
+    if cat then
+        cat.dirty = false
     end
 end
 
---- Clear the changed flag for a specific ghost entry
+--- Clear the changed flag for a single entry
 --- @param surface_index number The surface index
---- @param ghost_key string The ghost key ("entity_name:quality")
-function gc_storage.clear_ghost_changed(surface_index, ghost_key)
-    if not surface_index or not ghost_key then
+--- @param category string One of CATEGORIES
+--- @param key string The entry key ("item_name:quality")
+function gc_storage.clear_entry_changed(surface_index, category, key)
+    local cat = gc_storage.get_category(surface_index, category)
+    if not cat or not key then
         return
     end
 
-    local surface_data = storage.ghost_combinator and storage.ghost_combinator[surface_index]
-    if not surface_data then
-        return
-    end
-
-    local ghost_entry = surface_data.ghosts[ghost_key]
-    if ghost_entry then
-        ghost_entry.changed = false
+    local entry = cat.entries[key]
+    if entry then
+        entry.changed = false
     end
 end
 
---- Reset the slot high-water mark after a full resync
---- Called after full_resync_surface writes all slots and clears orphans
+--- Reset a category's slot high-water mark after a full resync
 --- @param surface_index number The surface index
-function gc_storage.reset_slot_high_water(surface_index)
-    if not surface_index then
-        return
-    end
-
-    local surface_data = storage.ghost_combinator and storage.ghost_combinator[surface_index]
-    if surface_data then
-        surface_data.slot_high_water = math.max(0, (surface_data.next_slot or 1) - 1)
+--- @param category string One of CATEGORIES
+function gc_storage.reset_slot_high_water(surface_index, category)
+    local cat = gc_storage.get_category(surface_index, category)
+    if cat then
+        cat.slot_high_water = math.max(0, cat.next_slot - 1)
     end
 end
 
@@ -332,119 +591,101 @@ end
 -- Slot Compaction
 --------------------------------------------------------------------------------
 
---- Compact ghost slots - remove zero-count entries and reassign slots
---- This is called periodically to prevent slot fragmentation
+--- Compact a category's slots - remove zero-count entries and close slot gaps
+--- Called periodically to prevent slot fragmentation
 --- @param surface_index number The surface index
---- @param current_tick number The current game tick
---- @return number removed_count Number of slots removed
---- @return number old_max_slot The maximum slot index before compaction (for clearing orphaned slots)
---- @return number new_max_slot The maximum slot index after compaction
-function gc_storage.compact_slots(surface_index, current_tick)
-    if not surface_index then
+--- @param category string One of CATEGORIES
+--- @return number removed_count Number of entries removed
+--- @return number old_max_slot Maximum slot index before compaction
+--- @return number new_max_slot Maximum slot index after compaction
+function gc_storage.compact_slots(surface_index, category)
+    local cat = gc_storage.get_category(surface_index, category)
+    if not cat then
         return 0, 0, 0
     end
 
-    local surface_data = storage.ghost_combinator and storage.ghost_combinator[surface_index]
-    if not surface_data then
-        return 0, 0, 0
-    end
+    local old_max_slot = cat.next_slot - 1
 
-    surface_data.last_compact_tick = current_tick
-
-    -- Track the old maximum slot for clearing orphaned combinator slots
-    local old_max_slot = surface_data.next_slot - 1
-
-    -- Find and remove zero-count entries
-    local removed_count = 0
-    local ghosts_to_remove = {}
-
-    for ghost_name, ghost_entry in pairs(surface_data.ghosts) do
-        if ghost_entry.count <= 0 then
-            table.insert(ghosts_to_remove, ghost_name)
+    -- Collect zero-count entries (cannot remove while iterating)
+    local to_remove = {}
+    for key, entry in pairs(cat.entries) do
+        if entry.count <= 0 then
+            to_remove[#to_remove + 1] = key
         end
     end
 
-    -- Remove zero-count entries
-    for _, ghost_name in ipairs(ghosts_to_remove) do
-        surface_data.ghosts[ghost_name] = nil
-        removed_count = removed_count + 1
+    local removed_count = #to_remove
+    for _, key in ipairs(to_remove) do
+        cat.entries[key] = nil
     end
 
-    -- Reassign slots to eliminate gaps
+    -- Reassign slots to eliminate gaps.
+    --
+    -- CRITICAL: iterate a SORTED array, never pairs(). Slot assignment is game
+    -- state, and Lua's hash iteration order is not guaranteed to match between
+    -- the host and a client that rebuilt this table from the save file - using
+    -- pairs() here would assign different slots on different peers and desync
+    -- the game. Sorting by existing slot also preserves the current display
+    -- order and keeps the number of entries marked `changed` to a minimum.
     if removed_count > 0 then
+        local survivors = {}
+        for key, entry in pairs(cat.entries) do
+            survivors[#survivors + 1] = {key = key, entry = entry}
+        end
+
+        table.sort(survivors, function(a, b)
+            if a.entry.slot ~= b.entry.slot then
+                return a.entry.slot < b.entry.slot
+            end
+            return a.key < b.key  -- deterministic tiebreak
+        end)
+
         local new_slot = 1
-        for ghost_name, ghost_entry in pairs(surface_data.ghosts) do
-            if ghost_entry.slot ~= new_slot then
-                ghost_entry.slot = new_slot
-                ghost_entry.changed = true
+        for _, item in ipairs(survivors) do
+            if item.entry.slot ~= new_slot then
+                item.entry.slot = new_slot
+                item.entry.changed = true
             end
             new_slot = new_slot + 1
         end
 
-        surface_data.next_slot = new_slot
-        surface_data.any_changes = true
+        cat.next_slot = new_slot
+        cat.dirty = true
     end
 
-    return removed_count, old_max_slot, surface_data.next_slot - 1
+    return removed_count, old_max_slot, cat.next_slot - 1
 end
 
+--- Record the tick at which a surface was last compacted
+--- @param surface_index number The surface index
+--- @param current_tick number The current game tick
+function gc_storage.set_last_compact_tick(surface_index, current_tick)
+    local surface_data = gc_storage.get_surface_data(surface_index)
+    if surface_data then
+        surface_data.last_compact_tick = current_tick
+    end
+end
 --------------------------------------------------------------------------------
--- Cleanup Functions
+-- Tracked Object Registrations (for on_object_destroyed)
 --------------------------------------------------------------------------------
 
---- Validate and clean up invalid combinators from storage
---- Should be called periodically or on load to ensure storage integrity
---- @param surface_index number|nil Optional surface index to clean (cleans all if nil)
-function gc_storage.validate_and_cleanup(surface_index)
-    if not storage.ghost_combinator then
+--- Record what a registered object contributes, so it can be undone on destroy
+--- @param registration_number uint64 From script.register_on_object_destroyed
+--- @param surface_index number The surface index
+--- @param category string One of CATEGORIES
+--- @param item_name string The resolved placing item name
+--- @param quality_name string|nil The quality name
+function gc_storage.register_tracked_object(registration_number, surface_index, category, item_name, quality_name)
+    if not registration_number or not item_name then
         return
     end
 
-    local surfaces_to_check = {}
-
-    if surface_index then
-        -- Clean specific surface
-        table.insert(surfaces_to_check, surface_index)
-    else
-        -- Clean all surfaces
-        for idx, _ in pairs(storage.ghost_combinator) do
-            table.insert(surfaces_to_check, idx)
-        end
-    end
-
-    for _, idx in ipairs(surfaces_to_check) do
-        local surface_data = storage.ghost_combinator[idx]
-        if surface_data then
-            local invalid_units = {}
-
-            -- Find invalid combinators
-            for unit_number, entity in pairs(surface_data.combinators) do
-                if not entity or not entity.valid then
-                    table.insert(invalid_units, unit_number)
-                end
-            end
-
-            -- Remove invalid entries
-            for _, unit_number in ipairs(invalid_units) do
-                surface_data.combinators[unit_number] = nil
-            end
-
-        end
-    end
-end
-
---------------------------------------------------------------------------------
--- Ghost Registration (for on_object_destroyed tracking)
---------------------------------------------------------------------------------
-
---- Register a ghost entity for destruction tracking
---- Called when a ghost is built to track when it's destroyed/revived
---- @param registration_number uint64 The registration number from script.register_on_object_destroyed
---- @param surface_index number The surface index
---- @param ghost_name string The ghost entity name
---- @param quality_name string The quality name
-function gc_storage.register_ghost_entity(registration_number, surface_index, ghost_name, quality_name)
-    if not registration_number then
+    -- Reject malformed records. A record with a bad category stores fine but its
+    -- eventual decrement silently no-ops, so the increment that already happened
+    -- never comes back down - invisible, permanent upward drift.
+    if not surface_index or not VALID_MODES[category] then
+        log("[ghost_combinator] ERROR: register_tracked_object with invalid surface/category: "
+            .. tostring(surface_index) .. "/" .. tostring(category))
         return
     end
 
@@ -452,17 +693,30 @@ function gc_storage.register_ghost_entity(registration_number, surface_index, gh
         storage.ghost_registrations = {}
     end
 
+    -- register_on_object_destroyed returns the SAME number for an object that is
+    -- already registered, so one number maps to one object. If a record already
+    -- exists under a DIFFERENT category, two categories are tracking one object
+    -- and only one of them can be undone on destroy - the other would leak.
+    local existing = storage.ghost_registrations[registration_number]
+    if existing and existing.category ~= category then
+        log(string.format(
+            "[ghost_combinator] WARNING: registration %s re-categorised %s -> %s; %s count may drift",
+            tostring(registration_number), tostring(existing.category), tostring(category),
+            tostring(existing.category)))
+    end
+
     storage.ghost_registrations[registration_number] = {
         surface = surface_index,
-        name = ghost_name,
+        category = category,
+        item_name = item_name,
         quality = quality_name or "normal"
     }
 end
 
---- Get ghost registration info by registration number
+--- Look up a tracked object's registration record
 --- @param registration_number uint64 The registration number
---- @return table|nil Ghost info {surface, name, quality} or nil if not found
-function gc_storage.get_ghost_registration(registration_number)
+--- @return table|nil {surface, category, item_name, quality} or nil
+function gc_storage.get_tracked_object(registration_number)
     if not registration_number or not storage.ghost_registrations then
         return nil
     end
@@ -470,14 +724,57 @@ function gc_storage.get_ghost_registration(registration_number)
     return storage.ghost_registrations[registration_number]
 end
 
---- Unregister a ghost entity (after destruction event handled)
+--- Remove a tracked object's registration record
+--- CRITICAL: Removing the record is what makes decrement idempotent - whichever
+--- code path fires first (cancel, destroy, mine) consumes the record, and any
+--- later path finds nothing and safely does nothing.
 --- @param registration_number uint64 The registration number
-function gc_storage.unregister_ghost_entity(registration_number)
+function gc_storage.unregister_tracked_object(registration_number)
     if not registration_number or not storage.ghost_registrations then
         return
     end
 
     storage.ghost_registrations[registration_number] = nil
+end
+
+--------------------------------------------------------------------------------
+-- Cleanup
+--------------------------------------------------------------------------------
+
+--- Remove invalid combinator references from storage
+--- @param surface_index number|nil Optional surface to clean (all surfaces if nil)
+--- @return number Number of invalid entries removed
+function gc_storage.validate_and_cleanup(surface_index)
+    if not storage.ghost_combinator then
+        return 0
+    end
+
+    local surfaces = {}
+    if surface_index then
+        surfaces[surface_index] = storage.ghost_combinator[surface_index]
+    else
+        surfaces = storage.ghost_combinator
+    end
+
+    local removed = 0
+
+    for _, surface_data in pairs(surfaces) do
+        if surface_data and surface_data.combinators then
+            local invalid = {}
+            for unit_number, record in pairs(surface_data.combinators) do
+                if not record or not record.entity or not record.entity.valid then
+                    invalid[#invalid + 1] = unit_number
+                end
+            end
+
+            for _, unit_number in ipairs(invalid) do
+                surface_data.combinators[unit_number] = nil
+                removed = removed + 1
+            end
+        end
+    end
+
+    return removed
 end
 
 return gc_storage

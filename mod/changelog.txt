@@ -1,4 +1,25 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.0.0
+Date: 2026-08-15
+  Features:
+    - Added an output mode selector. Each combinator now reports one kind of construction
+      demand: Builds (entity ghosts), Tiles (tile ghosts) or Upgrades (upgrade planner
+      requests). To see more than one at once, place several combinators and wire their
+      outputs together - the circuit network adds the signals.
+    - Tile ghosts are now tracked: landfill, concrete and its variants, stone brick, space
+      platform foundation, and the Space Age soils.
+    - Upgrade requests are now tracked, reported as the target item.
+  Bug Fixes:
+    - Combinators built by a space platform were never registered and output nothing.
+    - Entities whose placing item differs from their name reported an invalid signal
+      (stone brick tiles reported "stone-path", which is not an item).
+    - Surface data for deleted surfaces is now discarded instead of accumulating.
+  Changes:
+    - Existing saves are rebuilt from a one-time full surface scan on update. This also
+      picks up ghosts placed before the mod was installed, which were never counted before.
+      All existing combinators keep their current behaviour (Builds mode).
+    - Added /gc-rescan to rebuild tracking on demand.
+---------------------------------------------------------------------------------------------------
 Version: 0.2.0
 Date: 2026-08-03
   Update

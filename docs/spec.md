@@ -1,122 +1,186 @@
-# My Example Mod 
+# Ghost Combinator — Specification
+
+Mod internal name: `ghost-combinator` · Target: Factorio 2.1 (`base >= 2.1.0`, `flib >= 0.17.2`)
 
 ## Vision Statement
-Logistics data from roboports only list items and not construction requests.
-This combinator will keep a count of each ghost and create a set of signals of all ghosts on a surface.  
+
+Roboport logistics signals report *items in the logistics network* but say nothing about
+*construction demand*. The Ghost Combinator closes that gap: it keeps a running count of every
+construction ghost on its surface and emits one signal per ghost type, so players can automate
+against what still needs building.
 
 ## Core Components
 
-### 1. Technologies
+### 1. Technology — "Ghost Combinator"
 
-#### Ghost Combinator Technology
-- **Name:** 'Ghost Combinator"
-- **Cost:** 500x each science pack (automation, logistic, chemical, production, utility)
-- **Prerequisites:** Logistic system, Production science pack
-- **Unlocks:** Ghost Combinator
-- **Icon:** constant combinator
+| Field | Value |
+|---|---|
+| Name | `ghost-combinator` |
+| Prerequisites | `logistic-system`, `production-science-pack` |
+| Science packs | automation, logistic, chemical, production, utility (1 each per cycle) |
+| Unlocks | `ghost-combinator` recipe |
+| Icon | `graphics/entities/ghost-combinator-icon.png` (64x64) |
 
-### 2. Receiver Combinator
+> ⚠️ **Known deviation:** the intended cost is 500 cycles at 30s each. The prototype currently
+> ships `count = 5, time = 3` (dev-testing values). Tracked in `docs/todo.md`.
 
-**Entity Specifications:**
-- **Size:** 2x1 combinator
-- **Recipe:** 5x electronic circuits , 5x advanced circuits
-- **Placement:** no restrictions
-- **Health:** 150 (same as arithmetic combinator, scales with quality)
-- **Power:** 1kW 
-- **Circuit Connections:** i2 terminals (red out, green out)
-- **Graphics:** Constant Combinator with single red led on display
-- **Stack Size:** 50
-- **Rocket Capacity:** 50
+### 2. Ghost Combinator Entity
 
-**Configuration UI:**
-- Readonly signal out grid
+| Field | Value |
+|---|---|
+| Prototype type | `constant-combinator` (copied from vanilla via `flib_data_util.copy_prototype`) |
+| Size | 1x1 |
+| Health | 150 (scales with quality) |
+| Power | **None** — see note below |
+| Recipe | 5x electronic circuit, 5x advanced circuit (0.5s) |
+| Stack size | 50 |
+| Minable | 0.1s → `ghost-combinator` |
+| Corpse | `constant-combinator-remnants` |
+| Fast replace group | `ghost-combinator` |
+| Flags | `placeable-player`, `player-creation` |
+| Circuit connections | Vanilla constant combinator output (red + green) |
+| Graphics | Custom 4-way spritesheet + vanilla constant combinator shadow |
 
-**Signal Behavior:**
-- Output signals based on running statistics of ghost count on the smae surface
+**Power note:** the `constant-combinator` prototype type does **not** support `energy_source` or
+`active_energy_usage` — those belong to `CombinatorPrototype` (arithmetic/decider) and
+crafting-machine descendants. Setting them here is ignored or strands the entity in a permanent
+`no_power` status with no way to satisfy it. The Ghost Combinator therefore runs unpowered,
+consistent with vanilla constant combinators. (An earlier draft of this spec called for 1kW;
+that is not implementable on this prototype type.)
 
-**Implementation Critical:**
+### 3. Configuration UI
+
+Read-only. The GUI shows the current ghost counts as a signal grid (reusing
+`lib/gui/gui_circuit_inputs.lua`) plus a status row. There is nothing for the player to
+configure — the combinator always reports its own surface.
+
+## Signal Behavior
+
+- One signal per **(item, quality)** pair, value = number of outstanding ghosts.
+- Signals are written as `type = "item"` into a `LuaLogisticSection` on the combinator's
+  constant-combinator control behavior.
+- **Entity name ≠ item name.** Ghosts are keyed by the item that *places* them, resolved via
+  `LuaEntityPrototype.items_to_place_this[1]` (`signal_utils.get_item_name_for_entity`). This
+  merges entities that share a placement item — e.g. `straight-rail` and `curved-rail-a` both
+  report as `rail`.
+- Quality is always written explicitly; omitting it triggers a "non-trivial filter" error.
+- Tracking starts as soon as the mod is installed — **before** the technology is researched — so
+  a freshly built combinator immediately reflects existing ghosts.
+
+## Architecture
+
+### Storage Structure
+
 ```lua
--- Start registering ghosts immediatly before the technology is researched
--- Persist state across save/load
-```
-
-## Critical Implementation Warnings
-
-### MUST Handle:
-1. **Entity lifecycle events** - Cleanup when entities destroyed
-2. **Save/Load** - Properly serialize global state
-3. **Multiplayer** - Ensure signal sync across players
-4. **Quality scaling** - Apply quality bonuses to health/power
-
-## Architecture Notes
-
-### Global State Structure
-For each surface maintain a list of ghost combinators and active_ghosts.  Each entity type will have a slot id to update the slot in the constant combinator.
-Every 5-10 seconds we will run a process to remove entity names that are at zero and compress the slot numbers to avoid gaps long term
-```lua
-sotrage.<modname> = {
-  ghost_combinator_data= {
-    [surface_id] = {
-      ghost_combinators = {
-        entity
-      }
-      any_changes = true/false
-      active_ghosts = {
-        entity_name -> slot_id,count,changed
-      }
-    }
+storage.ghost_combinator = {
+  [surface_index] = {
+    combinators = { [unit_number] = LuaEntity },
+    ghosts = {
+      ["<item_name>:<quality>"] = {
+        count      = N,
+        slot       = M,          -- logistic section slot index
+        changed    = boolean,    -- dirty flag, drives incremental writes
+        item_name  = "iron-chest",
+        quality    = "normal",
+      },
+    },
+    any_changes      = boolean,  -- surface-level dirty flag
+    next_slot        = 1,
+    last_compact_tick = 0,
+    slot_high_water  = 0,        -- highest slot ever used; bounds orphan clearing on resync
   },
+}
+
+storage.ghost_registrations = {
+  [registration_number] = { surface = idx, name = ghost_name, quality = quality_name },
+}
+
+storage.player_gui_states = { [player_index] = { open_entity, gui_type, is_ghost } }
 ```
 
-### Performance Optimizations
-we will register every ghost in on_built() and update the data structure.  we will limit redundant checks and ensure speed of the update is critical.
-We will update the combinator slots every tick not every ghost.  we will use the changed flag on the active ghosts dictionary to limit the updates for speed, clearing them as needed. (iterate over active ghost keys and if changed iterate over the combinators)
+### Lifecycle
 
-## Edge Cases & Solutions
+**Increment** — `on_built_entity`, `on_robot_built_entity`, `script_raised_built`,
+`script_raised_revive`. Registered without filters (ghost tracking must see every entity), so
+the handler's first line is a `entity.type ~= "entity-ghost"` fast rejection.
 
-| Edge Case | Solution |
-|-----------|----------|
-*TBD*
+**Decrement** — every tracked ghost is registered with
+`script.register_on_object_destroyed()`, and `on_object_destroyed` drives the decrement. This is
+deliberately *not* done via mined/died events, because `on_object_destroyed` also fires when a
+ghost is **revived** into a real entity, which is the most common way a ghost disappears.
+
+### Update Cadence
+
+| Cadence | Work |
+|---|---|
+| Every tick | For each surface with `any_changes`, write only the `changed` slots. Dirty flags clear only if *every* combinator write succeeded, so a failure retries next tick. |
+| Every 300 ticks (5s) | Compact: drop zero-count entries, reassign slots to close gaps, clear orphaned slots above the new max. |
+| Every 600 ticks (10s) | Full resync: rewrite every slot from storage truth up to `slot_high_water`, clearing orphans. Safety net against desync from failed incremental writes. |
+
+### Performance Constraints
+
+The build handler runs for *every* entity placed anywhere on the map, so it must reject
+non-ghosts immediately and allocate nothing in the common case. Combinator slots update on a
+tick loop rather than per-ghost, gated by the `changed` / `any_changes` dirty flags.
+
+## Critical Implementation Requirements
+
+1. **Entity lifecycle** — clean up storage and any open GUI when a combinator is destroyed.
+2. **Save/load** — all state lives in `storage`; `globals.init_storage()` runs on both `on_init`
+   and `on_configuration_changed`.
+3. **Multiplayer** — all state changes are deterministic and event-driven; no per-player state
+   affects signal output.
+4. **Quality** — health scales with quality automatically; ghost counts are keyed per quality.
+5. **Invalid references** — combinator `LuaEntity` references stored per surface are validated
+   on every use and dropped when stale.
+
+## Debug Commands
+
+| Command | Effect |
+|---|---|
+| `/gc-ghost-state` | Dump per-surface ghost counts, slot assignments, combinator count, registration count |
+| `/gc-ghost-clear [surface_id]` | Clear tracking data for one surface, or all surfaces if omitted |
 
 ## Validation Checklist
 
 ### Core Functionality
-- [ ] Red/green wire separation preserved through transmission  
-- [ ] All entities require appropriate tech unlock
+- [x] One signal per ghost item/quality with correct count
+- [x] Counts survive ghost revival (bot builds it) as well as manual removal
+- [x] Entities sharing a placement item merge into one signal (`rail`)
+- [x] Tracking active before the technology is researched
+- [ ] Recipe gated behind the technology unlock
 
 ### Entity Behavior
-- [ ] Health values scale with quality
-- [ ] Power consumption scales with quality
-- [ ] Entities can be blueprinted and copy/pasted
-- [ ] Rotation works correctly for all entities
+- [x] Health scales with quality
+- [ ] Entity can be blueprinted and copy/pasted
 - [ ] Circuit connections preserved in blueprints
+- [x] No power requirement (constant-combinator prototype limitation)
 
 ### UI/UX
-- [ ] Surface selector shows all discovered planets
-- [ ] LED indicators show active state
-- [ ] GUI responsive to changes
+- [x] Read-only signal grid reflects live ghost counts
+- [x] Pipette (`gui-pipette-signal`) works on GUI signal buttons
+- [ ] GUI refreshes while open as counts change
 
 ### Events & Lifecycle
-- [ ] Platform lifecycle events handled
-- [ ] Entity destroyed events cleanup global state
-- [ ] Save/load preserves all state
-- [ ] Multiplayer synchronized properly
+- [x] `on_object_destroyed` cleanup decrements and unregisters
+- [x] Combinator destruction clears storage and closes open GUIs
+- [ ] Save/load verified across a real save cycle
+- [ ] Multi-surface verified (Nauvis, other planets, space platforms)
 
-## Success Criteria
+## Known Limitations
 
-Players can successfully:
-1. Build Passthrough Combinators on the planet
-2. Configure receiver combinators to connect to specific planets
-5. See clear visual feedback (LEDs, status text) of system state
-6. Create blueprints incorporating the new entities
-7. Scale up to multiple planets and platforms without issues
-8. Use familiar Factorio UI patterns throughout
+1. **Bootstrap** — ghosts that existed before the mod was installed are not tracked. There is no
+   startup scan.
+2. **Signal type** — output is always `type = "item"`. An entity with no
+   `items_to_place_this` falls back to its entity name, which may not resolve to a real item
+   signal and can render as a placeholder icon.
+3. **Coverage** — only `entity-ghost` objects are counted. Upgrade requests, tile ghosts
+   (landfill, concrete, space platform foundation), and deconstruction orders are **not**
+   tracked. See `docs/todo.md`.
 
 ## Final Notes
 
-- This mod extends vanilla without replacing functionality
-- All vanilla platform behaviors remain intact
-- Circuit control is optional - players can ignore it entirely
-- Focus on intuitive, Factorio-like user experience
-- Prioritize stability ond performancever feature complexity
-- When in doubt, follow vanilla factorio patterns
+- Extends vanilla without replacing anything; all vanilla behavior stays intact.
+- Circuit usage is entirely optional — players can ignore the mod's output.
+- Prioritize stability and per-tick performance over feature count.
+- When in doubt, follow vanilla Factorio patterns.

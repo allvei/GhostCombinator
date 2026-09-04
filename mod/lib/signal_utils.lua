@@ -402,13 +402,33 @@ function signal_utils.format_signal_for_display(signal_data)
 end
 
 --[[
+  MEMO: ghost_name -> item_name resolution cache
+
+  Ghost tracking runs on EVERY entity built anywhere on the map, so resolving the
+  placement item must not cost a prototype lookup per ghost. The mapping is derived
+  purely from prototypes, so it is identical on every peer and deterministic.
+
+  CRITICAL: This is a module-local table, NOT storage. It is derived data and is
+  rebuilt lazily after load. Never persist it - prototype names can change between
+  mod versions.
+
+  Key is "<kind>:<name>" so entity and tile prototypes sharing a name cannot collide.
+--]]
+local item_name_memo = {}
+
+--[[
   Look up the item name that places a given entity
 
   Entity names don't always match item names (e.g., "straight-rail" -> "rail")
   Uses LuaEntityPrototype.items_to_place_this to find the correct item.
 
   @param entity_name string: The entity prototype name (e.g., ghost_name)
-  @return string: The item name that places this entity (falls back to entity_name if not found)
+  @return string|nil: The item name that places this entity, or nil if unresolvable
+
+  CRITICAL: Returns nil (not the entity name) when the placing item cannot be
+  determined. Falling back to the raw prototype name emits a signal for an item
+  that may not exist - e.g. the tile "stone-path" is placed by item "stone-brick",
+  so a "stone-path" signal is invalid. Callers must skip nil results.
 
   EXAMPLE:
     get_item_name_for_entity("straight-rail")
@@ -422,22 +442,105 @@ function signal_utils.get_item_name_for_entity(entity_name)
     return nil
   end
 
-  -- Look up the entity prototype
+  local memo_key = "e:" .. entity_name
+  local cached = item_name_memo[memo_key]
+  if cached ~= nil then
+    -- false is the memoized "unresolvable" marker (nil would re-lookup every time)
+    if cached == false then return nil end
+    return cached
+  end
+
+  local resolved = nil
   local entity_proto = prototypes.entity[entity_name]
-  if not entity_proto then
-    -- Entity prototype not found, fall back to entity name
-    return entity_name
+  if entity_proto then
+    -- Construction bots use the first item in this array
+    local items_to_place = entity_proto.items_to_place_this
+    if items_to_place and #items_to_place > 0 then
+      resolved = items_to_place[1].name
+    end
   end
 
-  -- Check if items_to_place_this exists and has entries
-  -- Construction bots use the first item in this array
-  local items_to_place = entity_proto.items_to_place_this
-  if items_to_place and #items_to_place > 0 then
-    return items_to_place[1].name
+  item_name_memo[memo_key] = resolved or false
+  return resolved
+end
+
+--[[
+  Look up the item name that places a given tile
+
+  Tile names often differ from their placing item (e.g., "stone-path" -> "stone-brick").
+  Uses LuaTilePrototype.items_to_place_this, which has the same shape as the entity
+  version (array of ItemToPlace, each with .name and .count).
+
+  @param tile_name string: The tile prototype name
+  @return string|nil: The item name that places this tile, or nil if unresolvable
+
+  EXAMPLE:
+    get_item_name_for_tile("stone-path")
+    -- Returns: "stone-brick"
+
+    get_item_name_for_tile("refined-concrete")
+    -- Returns: "refined-concrete"
+--]]
+function signal_utils.get_item_name_for_tile(tile_name)
+  if not tile_name then
+    return nil
   end
 
-  -- No items_to_place_this defined, fall back to entity name
-  return entity_name
+  local memo_key = "t:" .. tile_name
+  local cached = item_name_memo[memo_key]
+  if cached ~= nil then
+    if cached == false then return nil end
+    return cached
+  end
+
+  local resolved = nil
+  local tile_proto = prototypes.tile[tile_name]
+  if tile_proto then
+    local items_to_place = tile_proto.items_to_place_this
+    if items_to_place and #items_to_place > 0 then
+      resolved = items_to_place[1].name
+    end
+  end
+
+  item_name_memo[memo_key] = resolved or false
+  return resolved
+end
+
+--[[
+  Resolve the placing item for ANY ghost - entity-ghost or tile-ghost
+
+  This is the single resolver both ghost kinds should use.
+
+  LuaEntity.ghost_prototype is documented as a union of
+  LuaEntityPrototype | LuaTilePrototype, and BOTH expose
+  items_to_place_this :: array[ItemToPlace], so one code path covers both.
+
+  We dispatch on entity.type rather than reading ghost_prototype directly so the
+  memo above absorbs the cost - ghost_name is a plain string, whereas touching
+  ghost_prototype allocates a prototype wrapper on every call.
+
+  @param ghost LuaEntity: A ghost entity (type "entity-ghost" or "tile-ghost")
+  @return string|nil: The item name that places it, or nil if unresolvable
+
+  EXAMPLE:
+    -- entity-ghost of straight-rail  -> "rail"
+    -- tile-ghost of stone-path       -> "stone-brick"
+    -- tile-ghost of refined-concrete -> "refined-concrete"
+--]]
+function signal_utils.get_item_name_for_ghost(ghost)
+  if not ghost or not ghost.valid then
+    return nil
+  end
+
+  local ghost_type = ghost.type
+  if ghost_type == "tile-ghost" then
+    return signal_utils.get_item_name_for_tile(ghost.ghost_name)
+  elseif ghost_type == "entity-ghost" then
+    return signal_utils.get_item_name_for_entity(ghost.ghost_name)
+  end
+
+  -- Not a ghost at all
+  return nil
 end
 
 --------------------------------------------------------------------------------

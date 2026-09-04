@@ -18,18 +18,16 @@ MOD_FULL_NAME := $(MOD_NAME)_$(MOD_VERSION)
 
 # Platform detection for Factorio mod directory
 UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Linux)
-    FACTORIO_MODS_DIR := $(HOME)/.factorio/mods
+# APPDATA is set on Windows, and under WSL when exported via WSLENV. It takes
+# precedence so a WSL build deploys to the Windows Factorio install.
+# ?= so an explicit FACTORIO_MODS_DIR from the environment always wins.
+ifdef APPDATA
+    FACTORIO_MODS_DIR ?= $(APPDATA)/Factorio/mods
+else ifeq ($(UNAME_S),Darwin)
+    FACTORIO_MODS_DIR ?= $(HOME)/Library/Application Support/factorio/mods
+else
+    FACTORIO_MODS_DIR ?= $(HOME)/.factorio/mods
 endif
-ifeq ($(UNAME_S),Darwin)
-    FACTORIO_MODS_DIR := $(HOME)/Library/Application\ Support/factorio/mods
-endif
-ifdef OS  # Windows
-    FACTORIO_MODS_DIR := $(APPDATA)/Factorio/mods
-endif
-
-# Allow override via environment variable
-FACTORIO_MODS_DIR ?= $(HOME)/.factorio/mods
 
 # Targets
 # -------

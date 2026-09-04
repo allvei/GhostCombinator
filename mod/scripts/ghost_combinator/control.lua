@@ -1,142 +1,351 @@
 -- Ghost Combinator - Control Module
--- Handles all entity lifecycle events and ghost tracking
--- CRITICAL: Performance-critical ghost tracking - must be FAST!
+-- Entity lifecycle, demand tracking, and combinator output writing
+-- CRITICAL: Performance-critical tracking paths - must be FAST!
+--
+-- Lifecycle handlers (on_built / on_removed / blueprint / paste / clone) follow
+-- FactorioBaseMod's passthrough_combinator control module so this mod stays
+-- consistent with its sibling mods.
 
 local gc_storage = require("scripts.ghost_combinator.storage")
+local gc_config = require("scripts.ghost_combinator.config")
 local globals = require("scripts.globals")
+local entity_lib = require("lib.entity_lib")
+local signal_utils = require("lib.signal_utils")
 
 local control = {}
 
 -- Entity name constant
 local GHOST_COMBINATOR = "ghost-combinator"
 
--- Update interval for combinator slots (every tick for responsiveness)
-local UPDATE_INTERVAL = 1
+--- Maps a ghost entity's prototype type to the demand category it feeds.
+--- Used as the fast-rejection test on the build hot path: a nil lookup means
+--- "not a ghost we track" and costs one hash probe.
+local GHOST_TYPE_CATEGORY = {
+    ["entity-ghost"] = "builds",
+    ["tile-ghost"] = "tiles"
+}
+
+local UPGRADE_CATEGORY = "upgrades"
 
 -----------------------------------------------------------
--- LOCAL HELPER FUNCTIONS
+-- LOCAL HELPERS
 -----------------------------------------------------------
 
---- Initialize all slots for a combinator with current ghost data
---- Used when a new combinator is placed to populate it immediately
+--- Get an entity's quality name, defaulting to "normal"
+--- @param entity LuaEntity The entity to read
+--- @return string The quality name
+local function quality_of(entity)
+    return entity.quality and entity.quality.name or "normal"
+end
+
+--- Get or create logistic section 1 on a combinator
 --- @param combinator LuaEntity The combinator entity
---- @param ghosts table Table of ghost_name -> {count, slot, changed}
---- @return boolean True if initialization succeeded
-local function initialize_combinator_slots(combinator, ghosts)
-    if not combinator or not combinator.valid then
-        return false
-    end
-
-    -- Get control behavior
+--- @return LuaLogisticSection|nil The section, or nil if unavailable
+local function get_section(combinator)
     local cb = combinator.get_control_behavior()
     if not cb then
         log("[ghost_combinator] WARNING: Combinator has no control behavior")
-        return false
+        return nil
     end
 
-    -- Get or create section 1
     local section = cb.get_section(1)
     if not section then
         section = cb.add_section("")
         if not section then
             log("[ghost_combinator] WARNING: Could not create section for combinator")
-            return false
+            return nil
         end
     end
 
-    -- Write ALL slots (ignore changed flag - this is initialization)
-    local slot_count = 0
-    for ghost_key, ghost_data in pairs(ghosts) do
-        if ghost_data.count > 0 and ghost_data.item_name then
-            -- Use stored item name and quality for signal output
-            local filter = {
-                value = {
-                    type = "item",
-                    name = ghost_data.item_name,
-                    quality = ghost_data.quality or "normal"
-                },
-                min = ghost_data.count
-            }
-            section.set_slot(ghost_data.slot, filter)
-            slot_count = slot_count + 1
+    return section
+end
+
+--- Build the LogisticFilter for an entry
+--- CRITICAL: quality must be specified explicitly or Factorio rejects the filter
+--- as "non-trivial".
+--- @param entry table The category entry
+--- @return table A LogisticFilter table
+local function filter_for(entry)
+    return {
+        value = {
+            type = "item",
+            name = entry.item_name,
+            quality = entry.quality or "normal"
+        },
+        min = entry.count
+    }
+end
+
+--- Write every entry of a category into a combinator, clearing stale slots
+--- Used when a combinator is first placed, when its mode changes, and on resync -
+--- all cases where the per-entry `changed` flag cannot be trusted because the
+--- combinator's current contents bear no relation to the category's entries.
+--- @param combinator LuaEntity The combinator entity
+--- @param entries table The category's entries table
+--- @return boolean True if the write succeeded
+local function write_all_slots(combinator, entries)
+    if not combinator or not combinator.valid then
+        return false
+    end
+
+    local section = get_section(combinator)
+    if not section then
+        return false
+    end
+
+    -- Wipe first: slot numbering differs per category, so anything already
+    -- present is meaningless for the category we are about to write. This is why
+    -- no slot ceiling needs to be tracked or passed in - the whole section goes.
+    section.filters = {}
+
+    for _, entry in pairs(entries) do
+        if entry.count > 0 and entry.item_name then
+            section.set_slot(entry.slot, filter_for(entry))
         end
     end
 
-    return true, slot_count
+    return true
 end
 
 -----------------------------------------------------------
--- GHOST TRACKING HANDLERS
--- CRITICAL: Called for ALL entity events - must be FAST!
+-- DEMAND TRACKING - GHOSTS AND TILE GHOSTS
+-- CRITICAL: Called for ALL entity build events - must be FAST!
 -----------------------------------------------------------
 
---- Handle ghost entity built
---- CRITICAL: This is called for EVERY entity built - type check MUST be first!
+--- Count and register a ghost, unless it is already tracked
+--- IDEMPOTENT: register_on_object_destroyed returns the SAME number for an
+--- already-registered object, so an existing record proves we already counted
+--- this ghost and we do nothing. That makes it safe to call from both the build
+--- event and the deferred upgrade re-check without risking a double count.
+--- @param entity LuaEntity The ghost entity
+--- @return boolean True if the ghost was newly counted
+local function track_ghost(entity)
+    local category = entity and GHOST_TYPE_CATEGORY[entity.type]
+    if not category then
+        return false
+    end
+
+    -- Resolve the item that places this ghost. Handles both entity ghosts
+    -- (straight-rail -> rail) and tile ghosts (stone-path -> stone-brick).
+    local item_name = signal_utils.get_item_name_for_ghost(entity)
+    if not item_name then
+        -- No placing item (e.g. a script-created ghost for an item-less
+        -- prototype). Skip entirely - do NOT register for destruction, or we
+        -- would leave a registration record that can never be balanced.
+        return false
+    end
+
+    -- Register for on_object_destroyed. This fires for ALL destruction reasons
+    -- including revive (ghost built into a real entity), which is the most common
+    -- way a ghost disappears and is NOT covered by the mined/died events.
+    local registration_number = script.register_on_object_destroyed(entity)
+
+    if gc_storage.get_tracked_object(registration_number) then
+        return false  -- already counted
+    end
+
+    local surface_index = entity.surface.index
+    local quality_name = quality_of(entity)
+
+    gc_storage.increment(surface_index, category, item_name, quality_name)
+    gc_storage.register_tracked_object(
+        registration_number, surface_index, category, item_name, quality_name)
+
+    return true
+end
+
+--- Handle a ghost (entity-ghost or tile-ghost) being built
+--- CRITICAL: This runs for EVERY entity built anywhere on the map. The category
+--- lookup MUST be the first thing that happens so non-ghosts cost one hash probe.
 --- @param event EventData Event data containing entity
 function control.on_ghost_built(event)
     local entity = event.entity
 
-    -- FAST rejection - type check MUST be first line!
-    if not entity or entity.type ~= "entity-ghost" then
+    -- FAST rejection - single hash probe for the overwhelmingly common case
+    if not entity or not GHOST_TYPE_CATEGORY[entity.type] then
         return
     end
 
-    local ghost_name = entity.ghost_name
-    local surface_index = entity.surface.index
-    local quality_name = entity.quality and entity.quality.name or "normal"
-
-    -- Increment ghost count (track by name + quality)
-    gc_storage.increment_ghost(surface_index, ghost_name, quality_name)
-
-    -- Register for on_object_destroyed to detect when ghost is revived/destroyed
-    -- This fires for ALL destruction reasons including revive (ghost built into real entity)
-    local reg_number = script.register_on_object_destroyed(entity)
-    gc_storage.register_ghost_entity(reg_number, surface_index, ghost_name, quality_name)
-
-    -- Debug logging (can be disabled for production)
-    -- log("[ghost_combinator] Ghost built: " .. ghost_name .. " (" .. quality_name .. ") on surface " .. surface_index)
+    track_ghost(entity)
 end
 
--- NOTE: on_ghost_removed is no longer used - ghost destruction tracking is now handled
--- entirely by on_object_destroyed which fires for ALL destruction reasons including
--- revive (ghost built into real entity), mined, died, script-destroyed, etc.
+--- Handle a ghost being upgraded (upgrade planner dragged over ghosts)
+--- The engine destroys the old ghost and creates a replacement. The destruction
+--- balances itself via on_object_destroyed, but the replacement may not raise a
+--- build event, which would leave it uncounted forever. Record the position and
+--- re-check it next tick; track_ghost's idempotency makes this safe even if a
+--- build event DID fire.
+--- @param event EventData.on_pre_ghost_upgraded
+function control.on_pre_ghost_upgraded(event)
+    local ghost = event.ghost
+    if not ghost or not ghost.valid then
+        return
+    end
 
---- Handle on_object_destroyed event for registered ghosts
---- This fires when ANY registered object is destroyed, including ghost revives
---- @param event EventData.on_object_destroyed Event containing registration_number
-function control.on_object_destroyed(event)
-    local registration_number = event.registration_number
+    if not GHOST_TYPE_CATEGORY[ghost.type] then
+        return
+    end
 
-    -- Look up if this was a tracked ghost
-    local ghost_info = gc_storage.get_ghost_registration(registration_number)
-    if ghost_info then
-        -- Decrement ghost count - this ghost was destroyed/revived
-        gc_storage.decrement_ghost(ghost_info.surface, ghost_info.name, ghost_info.quality)
+    gc_storage.queue_pending_ghost(ghost.surface.index, ghost.position)
+end
 
-        -- Clean up registration
-        gc_storage.unregister_ghost_entity(registration_number)
+--- Re-check positions where a ghost was upgraded last tick
+--- Called at the top of on_tick.
+function control.process_pending_ghosts()
+    local pending = gc_storage.take_pending_ghosts()
 
-        -- Debug logging (can be disabled for production)
-        -- log("[ghost_combinator] Ghost destroyed via on_object_destroyed: " .. ghost_info.name .. " (" .. ghost_info.quality .. ") on surface " .. ghost_info.surface)
+    for _, item in ipairs(pending) do
+        local surface = game.surfaces[item.surface]
+        if surface and surface.valid then
+            local found = surface.find_entities_filtered{
+                position = item.position,
+                type = {"entity-ghost", "tile-ghost"}
+            }
+            for _, ghost in pairs(found) do
+                if ghost.valid then
+                    track_ghost(ghost)
+                end
+            end
+        end
     end
 end
 
+--- Handle a tracked object being destroyed
+--- Balances whatever the registration record says this object contributed.
+--- @param event EventData.on_object_destroyed
+function control.on_object_destroyed(event)
+    local registration_number = event.registration_number
+
+    local record = gc_storage.get_tracked_object(registration_number)
+    if not record then
+        return
+    end
+
+    -- Consume the record BEFORE decrementing. This is what makes the decrement
+    -- idempotent across the overlapping upgrade paths (cancel / complete / mine):
+    -- whichever fires first takes the record, and any later path finds nothing.
+    gc_storage.unregister_tracked_object(registration_number)
+
+    gc_storage.decrement(record.surface, record.category, record.item_name, record.quality)
+end
+
 -----------------------------------------------------------
--- COMBINATOR LIFECYCLE HANDLERS
--- These handle the ghost combinator entity itself
+-- DEMAND TRACKING - UPGRADE REQUESTS
+-----------------------------------------------------------
+
+--- Handle an entity being marked for upgrade
+--- @param event EventData.on_marked_for_upgrade
+function control.on_marked_for_upgrade(event)
+    local entity = event.entity
+    if not entity or not entity.valid then
+        return
+    end
+
+    -- Ghosts marked for upgrade go through on_pre_ghost_upgraded instead, which
+    -- replaces the ghost rather than marking it. Counting them here would
+    -- double-count against the "builds" entry the ghost already owns, and both
+    -- would share one registration number.
+    if entity_lib.is_ghost(entity) then
+        return
+    end
+
+    local surface_index = entity.surface.index
+
+    -- Take the registration number up front. Registering an already-registered
+    -- object returns the SAME number, so this both identifies an existing record
+    -- and creates one we can attach to.
+    local registration_number = script.register_on_object_destroyed(entity)
+
+    -- previous_target/previous_quality are set when the entity was ALREADY
+    -- marked and is being re-marked at a different target. Undo the old demand
+    -- before adding the new one, or the counts drift upward on every re-mark.
+    -- NOTE: these two fields are Factorio 2.1+ only (absent through 2.0.60).
+    local previous_target = event.previous_target
+    if previous_target then
+        local previous_item = signal_utils.get_item_name_for_entity(previous_target.name)
+        if previous_item then
+            local previous_quality = event.previous_quality and event.previous_quality.name or "normal"
+            gc_storage.decrement(surface_index, UPGRADE_CATEGORY, previous_item, previous_quality)
+        end
+    end
+
+    -- CRITICAL: every bail-out below must drop the record. We may have just
+    -- decremented the previous target; leaving the old record in place would let
+    -- on_object_destroyed decrement it a SECOND time when the entity dies,
+    -- drifting that item's count down permanently.
+    local target = event.target
+    if not target then
+        gc_storage.unregister_tracked_object(registration_number)
+        return
+    end
+
+    local item_name = signal_utils.get_item_name_for_entity(target.name)
+    if not item_name then
+        gc_storage.unregister_tracked_object(registration_number)
+        return
+    end
+
+    local quality_name = event.quality and event.quality.name or "normal"
+    gc_storage.increment(surface_index, UPGRADE_CATEGORY, item_name, quality_name)
+
+    -- Overwrites this entity's own record in place rather than creating a second.
+    gc_storage.register_tracked_object(
+        registration_number, surface_index, UPGRADE_CATEGORY, item_name, quality_name)
+end
+
+--- Handle an upgrade order being cancelled
+--- @param event EventData.on_cancelled_upgrade
+function control.on_cancelled_upgrade(event)
+    local entity = event.entity
+    if not entity or not entity.valid then
+        return
+    end
+
+    if entity_lib.is_ghost(entity) then
+        return
+    end
+
+    -- We need this entity's registration number to consume its record. Calling
+    -- register_on_object_destroyed again is documented to return the SAME number
+    -- for an already-registered object, so this is a lookup, not a new
+    -- registration, for every entity we actually marked.
+    local registration_number = script.register_on_object_destroyed(entity)
+
+    local record = gc_storage.get_tracked_object(registration_number)
+    if not record or record.category ~= UPGRADE_CATEGORY then
+        -- Never tracked (e.g. marked before this mod was installed and not yet
+        -- rescanned), or the record belongs to a different category. Nothing to
+        -- undo - decrementing from the event's target here would corrupt counts.
+        return
+    end
+
+    gc_storage.unregister_tracked_object(registration_number)
+    gc_storage.decrement(record.surface, record.category, record.item_name, record.quality)
+end
+
+-----------------------------------------------------------
+-- COMBINATOR LIFECYCLE
+-- Follows FactorioBaseMod's on_built / on_removed shape
 -----------------------------------------------------------
 
 --- Shared handler for combinator build events
---- @param event EventData Event data containing entity
+--- Handles both real entities and ghosts, with blueprint tag support
+--- @param event EventData Event data containing entity and optional tags
 function control.on_combinator_built(event)
     local entity = event.entity
+    local tags = event.tags
 
     if not entity or not entity.valid then
         return
     end
 
-    -- Skip ghosts
-    if entity.type == "entity-ghost" then
+    -- Ghosts carry their config in tags, never in storage
+    if entity_lib.is_ghost(entity) then
+        if entity_lib.is_type(entity, GHOST_COMBINATOR) then
+            if tags and tags[gc_storage.CONFIG_TAG] then
+                gc_config.save_ghost_config(entity, tags[gc_storage.CONFIG_TAG])
+            end
+        end
         return
     end
 
@@ -145,17 +354,26 @@ function control.on_combinator_built(event)
         return
     end
 
-    -- Register the combinator
-    local success = gc_storage.register_combinator(entity)
-
-    if success then
-        -- Initialize combinator with current ghost data
-        local surface_index = entity.surface.index
-        local surface_data = gc_storage.get_surface_data(surface_index)
-        if surface_data and surface_data.ghosts then
-            initialize_combinator_slots(entity, surface_data.ghosts)
+    -- Restore the mode from blueprint tags if the ghost carried one
+    local mode = gc_storage.DEFAULT_MODE
+    if tags and tags[gc_storage.CONFIG_TAG] and tags[gc_storage.CONFIG_TAG].mode then
+        local tagged_mode = tags[gc_storage.CONFIG_TAG].mode
+        if gc_storage.is_valid_mode(tagged_mode) then
+            mode = tagged_mode
         end
     end
+
+    local record = gc_storage.register_combinator(entity, mode)
+    if not record then
+        log("[ghost_combinator] ERROR: Failed to register combinator")
+        return
+    end
+
+    -- Populate immediately with the full category contents. A dirty flag alone
+    -- is not enough: the tick loop only writes entries whose `changed` flag is
+    -- set, and a surface whose counts are all settled has none - a newly placed
+    -- combinator would stay blank until the next resync.
+    control.refresh_combinator(entity, mode)
 end
 
 --- Shared handler for combinator removal events
@@ -167,19 +385,16 @@ function control.on_combinator_removed(event)
         return
     end
 
-    -- Only handle our entity (including ghosts for cleanup)
-    if entity.name ~= GHOST_COMBINATOR and not (entity.type == "entity-ghost" and entity.ghost_name == GHOST_COMBINATOR) then
+    if not entity_lib.is_type(entity, GHOST_COMBINATOR) then
         return
     end
 
-    -- Skip ghost destruction
-    if entity.type == "entity-ghost" then
+    -- Ghost destruction needs no storage cleanup - ghosts never registered
+    if entity_lib.is_ghost(entity) then
         return
     end
 
     local unit_number = entity.unit_number
-    local surface_index = entity.surface.index
-
     if not unit_number then
         return
     end
@@ -187,137 +402,116 @@ function control.on_combinator_removed(event)
     -- Close any open GUIs for this entity
     globals.cleanup_player_gui_states_for_entity(entity, "ghost_combinator_gui")
 
-    -- Unregister from storage
-    gc_storage.unregister_combinator(unit_number, surface_index)
+    gc_storage.unregister_combinator(unit_number, entity.surface.index)
+end
+
+--- Rewrite one combinator's output from scratch for a given mode
+--- Called on placement and whenever the mode changes.
+--- @param entity LuaEntity The combinator entity
+--- @param mode string|nil The mode to write (defaults to the entity's current mode)
+--- @return boolean True if the write succeeded
+function control.refresh_combinator(entity, mode)
+    if not entity or not entity.valid then
+        return false
+    end
+
+    mode = mode or gc_config.get_mode(entity)
+
+    local surface_index = entity.surface.index
+    local category = gc_storage.get_category(surface_index, mode)
+    if not category then
+        return false
+    end
+
+    return write_all_slots(entity, category.entries)
 end
 
 -----------------------------------------------------------
 -- TICK HANDLERS
--- Update combinator slots and perform compaction
 -----------------------------------------------------------
 
---- Update combinator slots for surfaces with changes
---- Called every tick to ensure responsive updates
+--- Per-tick incremental update
+--- Walks each surface's categories and writes only the entries that changed,
+--- and only to the combinators actually displaying that category.
 --- @param event EventData.on_tick
 function control.on_tick(event)
+    -- Pick up replacement ghosts created by an upgrade last tick
+    control.process_pending_ghosts()
+
     if not storage.ghost_combinator then
         return
     end
 
-    -- Process each surface that has changes
     for surface_index, surface_data in pairs(storage.ghost_combinator) do
-        if surface_data.any_changes then
-            local all_succeeded = control.update_surface_combinators(surface_index, surface_data)
-            -- Only clear flags if ALL combinators received the update.
-            -- If any combinator failed, keep flags so the next tick retries.
-            if all_succeeded then
-                for ghost_key, _ in pairs(surface_data.ghosts) do
-                    gc_storage.clear_ghost_changed(surface_index, ghost_key)
+        local categories = surface_data.categories
+        if categories then
+            for category_name, category in pairs(categories) do
+                if category.dirty then
+                    local all_succeeded =
+                        control.update_combinators_for_category(surface_data, category_name, category)
+
+                    -- Only clear flags when EVERY combinator took the update.
+                    -- If one failed, keep them so the next tick retries.
+                    if all_succeeded then
+                        for _, entry in pairs(category.entries) do
+                            entry.changed = false
+                        end
+                        category.dirty = false
+                    end
                 end
-                gc_storage.clear_changes_flag(surface_index)
             end
         end
     end
 end
 
---- Update all combinators on a surface with current ghost data
---- Only updates slots that have changed
---- @param surface_index number The surface index
+--- Push changed entries of one category to the combinators displaying it
 --- @param surface_data table The surface data table
---- @return boolean True if ALL combinators were successfully updated
-function control.update_surface_combinators(surface_index, surface_data)
-    -- Get all combinators on this surface
+--- @param category_name string The category being updated
+--- @param category table The category record
+--- @return boolean True if all matching combinators were updated
+function control.update_combinators_for_category(surface_data, category_name, category)
     local combinators = surface_data.combinators
-
     if not combinators then
         return true
     end
 
     local all_succeeded = true
 
-    -- Update each combinator
-    for unit_number, combinator in pairs(combinators) do
-        if combinator and combinator.valid then
-            local success = control.update_combinator_slots(combinator, surface_data.ghosts)
-            if not success then
+    for unit_number, record in pairs(combinators) do
+        local entity = record and record.entity
+
+        if not entity or not entity.valid then
+            combinators[unit_number] = nil
+        elseif record.mode == category_name then
+            if not control.write_changed_slots(entity, category.entries) then
                 all_succeeded = false
             end
-        else
-            -- Combinator became invalid, remove it
-            surface_data.combinators[unit_number] = nil
         end
     end
 
-    -- NOTE: Changed flag clearing is now handled by the caller (on_tick)
-    -- only when all_succeeded is true, preventing lost updates on failure
     return all_succeeded
 end
 
---- Update a single combinator's slots with current ghost data
---- Uses LuaConstantCombinatorControlBehavior and LuaLogisticSection APIs
+--- Write only the changed entries of a category into one combinator
 --- @param combinator LuaEntity The combinator entity
---- @param ghosts table Table of ghost_name -> {count, slot, changed}
---- @return boolean True if update succeeded
-function control.update_combinator_slots(combinator, ghosts)
+--- @param entries table The category's entries
+--- @return boolean True if the write succeeded
+function control.write_changed_slots(combinator, entries)
     if not combinator or not combinator.valid then
         return false
     end
 
-    -- Get control behavior
-    local cb = combinator.get_control_behavior()
-    if not cb then
-        log("[ghost_combinator] WARNING: Combinator has no control behavior")
+    local section = get_section(combinator)
+    if not section then
         return false
     end
 
-    -- Get or create section 1
-    local section = cb.get_section(1)
-    if not section then
-        section = cb.add_section("")
-        if not section then
-            log("[ghost_combinator] WARNING: Could not create section for combinator")
-            return false
-        end
-    end
-
-    -- Update only changed slots
-    local updates = 0
-    local clears = 0
-
-    for ghost_key, ghost_data in pairs(ghosts) do
-        -- Only update if changed
-        if ghost_data.changed then
-            local slot_index = ghost_data.slot
-            local count = ghost_data.count
-
-            if count > 0 then
-                -- Get the item name and quality from stored data
-                local item_name = ghost_data.item_name
-                local quality_name = ghost_data.quality or "normal"
-
-                if not item_name then
-                    -- Skip if no item_name stored (shouldn't happen, but safety check)
-                    log("[ghost_combinator] WARNING: No item_name stored for ghost entry")
-                else
-                    -- Set slot with ghost item signal
-                    -- LogisticFilter format: {value = SignalFilter, min = count}
-                    -- CRITICAL: Must specify quality explicitly to avoid "non-trivial filter" error
-                    local filter = {
-                        value = {
-                            type = "item",
-                            name = item_name,
-                            quality = quality_name
-                        },
-                        min = count
-                    }
-
-                    section.set_slot(slot_index, filter)
-                end
-                updates = updates + 1
+    for _, entry in pairs(entries) do
+        if entry.changed then
+            if entry.count > 0 and entry.item_name then
+                section.set_slot(entry.slot, filter_for(entry))
             else
-                -- Clear slot if count is zero
-                section.clear_slot(slot_index)
-                clears = clears + 1
+                section.clear_slot(entry.slot)
             end
         end
     end
@@ -325,38 +519,53 @@ function control.update_combinator_slots(combinator, ghosts)
     return true
 end
 
---- Periodic slot compaction
---- Called periodically (via on_nth_tick) to remove zero-count entries
---- Also clears orphaned slots from combinators after compaction
+-----------------------------------------------------------
+-- PERIODIC COMPACTION
+-----------------------------------------------------------
+
+--- Remove zero-count entries and close slot gaps, per category
 --- @param event EventData.on_nth_tick
 function control.compact_ghost_slots(event)
     if not storage.ghost_combinator then
         return
     end
 
-    local current_tick = event.tick
-
-    -- Compact each surface
     for surface_index, surface_data in pairs(storage.ghost_combinator) do
-        local removed_count, old_max_slot, new_max_slot = gc_storage.compact_slots(surface_index, current_tick)
+        gc_storage.set_last_compact_tick(surface_index, event.tick)
 
-        -- If slots were removed, clear orphaned slots from all combinators
-        if removed_count > 0 and old_max_slot > new_max_slot then
-            for unit_number, combinator in pairs(surface_data.combinators) do
-                if combinator.valid then
-                    local cb = combinator.get_control_behavior()
-                    if cb and cb.valid then
-                        local section = cb.get_section(1)
-                        if section then
-                            -- Clear slots from new_max+1 to old_max
-                            for slot_idx = new_max_slot + 1, old_max_slot do
-                                section.clear_slot(slot_idx)
+        local categories = surface_data.categories
+        if categories then
+            for category_name, category in pairs(categories) do
+                local removed, old_max, new_max = gc_storage.compact_slots(surface_index, category_name)
+
+                -- Compaction renumbers slots, so every combinator on this
+                -- category must be rewritten wholesale, not incrementally.
+                if removed > 0 then
+                    local all_succeeded = true
+
+                    for unit_number, record in pairs(surface_data.combinators) do
+                        local entity = record and record.entity
+                        if not entity or not entity.valid then
+                            surface_data.combinators[unit_number] = nil
+                        elseif record.mode == category_name then
+                            if not write_all_slots(entity, category.entries) then
+                                all_succeeded = false
                             end
                         end
                     end
-                else
-                    -- Clean up invalid combinator reference
-                    surface_data.combinators[unit_number] = nil
+
+                    -- Clear the flags only if EVERY combinator took the rewrite,
+                    -- matching on_tick. Clearing them after a partial failure
+                    -- would strand that combinator with nothing left to re-mark
+                    -- it, leaving it stale until the next full resync.
+                    if all_succeeded then
+                        for _, entry in pairs(category.entries) do
+                            entry.changed = false
+                        end
+                        category.dirty = false
+                    end
+
+                    gc_storage.reset_slot_high_water(surface_index, category_name)
                 end
             end
         end
@@ -365,73 +574,56 @@ end
 
 -----------------------------------------------------------
 -- PERIODIC FULL RESYNC
--- Safety net: rewrites ALL combinator slots from storage truth
--- Catches any desync from failed incremental updates
+-- Safety net: rewrites every combinator from storage truth, catching any
+-- desync left by a failed incremental write.
 -----------------------------------------------------------
 
---- Full resync a single surface: rewrite ALL slots on ALL combinators
---- Ignores the 'changed' flag entirely - writes every ghost entry and clears
---- orphaned slots up to the slot_high_water mark
+--- Rewrite all combinators on one surface from storage
 --- @param surface_index number The surface index
 --- @param surface_data table The surface data table
 function control.full_resync_surface(surface_index, surface_data)
     local combinators = surface_data.combinators
-    if not combinators then
+    local categories = surface_data.categories
+    if not combinators or not categories then
         return
     end
 
-    -- Build slot → filter lookup for all active ghosts (count > 0)
-    local slot_filters = {}
-    local current_max_slot = math.max(0, (surface_data.next_slot or 1) - 1)
+    local all_succeeded = true
 
-    for ghost_key, ghost_data in pairs(surface_data.ghosts) do
-        if ghost_data.count > 0 and ghost_data.item_name then
-            slot_filters[ghost_data.slot] = {
-                value = {
-                    type = "item",
-                    name = ghost_data.item_name,
-                    quality = ghost_data.quality or "normal"
-                },
-                min = ghost_data.count
-            }
-        end
-    end
+    for unit_number, record in pairs(combinators) do
+        local entity = record and record.entity
 
-    -- Determine clearing range: highest slot that might have stale data
-    local clear_ceiling = math.max(current_max_slot, surface_data.slot_high_water or 0)
-
-    -- Resync each valid combinator
-    for unit_number, combinator in pairs(combinators) do
-        if combinator and combinator.valid then
-            local cb = combinator.get_control_behavior()
-            if cb then
-                local section = cb.get_section(1)
-                if not section then
-                    section = cb.add_section("")
-                end
-                if section then
-                    -- Write or clear every slot from 1 to clear_ceiling
-                    for slot_idx = 1, clear_ceiling do
-                        local filter = slot_filters[slot_idx]
-                        if filter then
-                            section.set_slot(slot_idx, filter)
-                        else
-                            section.clear_slot(slot_idx)
-                        end
-                    end
+        if not entity or not entity.valid then
+            combinators[unit_number] = nil
+        else
+            local category = categories[record.mode]
+            if category then
+                if not write_all_slots(entity, category.entries) then
+                    all_succeeded = false
                 end
             end
-        else
-            -- Clean up invalid combinator reference
-            surface_data.combinators[unit_number] = nil
         end
     end
 
-    -- Reset the high-water mark now that orphans are cleared
-    gc_storage.reset_slot_high_water(surface_index)
+    -- A successful resync IS a sync point: every combinator now matches storage
+    -- exactly, so nothing needs rewriting on the next tick. Leaving the flags set
+    -- would make the tick pass redundantly rewrite everything we just wrote.
+    -- On partial failure the flags stay, so the next tick retries.
+    if all_succeeded then
+        for _, category in pairs(categories) do
+            for _, entry in pairs(category.entries) do
+                entry.changed = false
+            end
+            category.dirty = false
+        end
+    end
+
+    for category_name in pairs(categories) do
+        gc_storage.reset_slot_high_water(surface_index, category_name)
+    end
 end
 
---- Full resync all surfaces - entry point for on_nth_tick handler
+--- Full resync of every surface - entry point for the on_nth_tick handler
 --- @param event EventData.on_nth_tick
 function control.full_resync_all(event)
     if not storage.ghost_combinator then
@@ -444,36 +636,92 @@ function control.full_resync_all(event)
 end
 
 -----------------------------------------------------------
--- BLUEPRINT AND COPY-PASTE HANDLERS
--- Ghost combinator is read-only, so these are mostly no-ops
+-- BLUEPRINT AND COPY-PASTE
+-- Taken from FactorioBaseMod's passthrough_combinator control module
 -----------------------------------------------------------
 
---- Handle player setup blueprint event
---- Ghost combinator has no configuration to save to blueprints
---- @param event EventData.on_player_setup_blueprint
-function control.on_player_setup_blueprint(event)
-    -- Ghost combinator is read-only, no config to save
-    -- This is a no-op, but we keep it for consistency
-end
-
---- Handle entity settings pasted event
---- Ghost combinator has no settings to paste
+--- Handle entity settings pasted (Shift+Right Click / Shift+Left Click)
 --- @param event EventData.on_entity_settings_pasted
 function control.on_entity_settings_pasted(event)
-    -- Ghost combinator is read-only, no settings to paste
-    -- This is a no-op, but we keep it for consistency
+    local source = event.source
+    local destination = event.destination
+
+    if not source or not source.valid then return end
+    if not destination or not destination.valid then return end
+
+    if not entity_lib.is_type(source, GHOST_COMBINATOR) then return end
+    if not entity_lib.is_type(destination, GHOST_COMBINATOR) then return end
+
+    local source_config = gc_config.serialize_config(source)
+    if not source_config then
+        log("[ghost_combinator] WARNING: Could not serialize source config")
+        return
+    end
+
+    gc_config.restore_config(destination, source_config)
+
+    -- Slot numbering differs per category, so the destination's output must be
+    -- rebuilt rather than incrementally patched.
+    if not entity_lib.is_ghost(destination) then
+        control.refresh_combinator(destination)
+    end
 end
 
---- Handle entity cloned event
---- Ghost combinator has no configuration to clone
+--- Handle entity cloned (editor, or another mod)
 --- @param event EventData.on_entity_cloned
 function control.on_entity_cloned(event)
-    -- Ghost combinator is read-only, no config to clone
-    -- This is a no-op, but we keep it for consistency
+    local source = event.source
+    local destination = event.destination
+
+    if not source or not source.valid then return end
+    if not destination or not destination.valid then return end
+
+    if not entity_lib.is_type(source, GHOST_COMBINATOR) then return end
+    if not entity_lib.is_type(destination, GHOST_COMBINATOR) then return end
+
+    local source_config = gc_config.serialize_config(source)
+    if not source_config then
+        log("[ghost_combinator] WARNING: Could not get source config for cloning")
+        return
+    end
+
+    gc_config.restore_config(destination, source_config)
+
+    if not entity_lib.is_ghost(destination) then
+        control.refresh_combinator(destination)
+    end
 end
 
------------------------------------------------------------
--- MODULE EXPORTS
------------------------------------------------------------
+--- Handle blueprint creation - save each combinator's mode into blueprint tags
+--- @param event EventData.on_player_setup_blueprint
+function control.on_player_setup_blueprint(event)
+    -- record is the blueprint-library case and is writable; stack is the
+    -- held-item case. Handling only `stack` silently drops the config for
+    -- library blueprints.
+    local bp = event.record or event.stack
+    if not bp then return end
+
+    local entities = bp.get_blueprint_entities()
+    if not entities then return end
+
+    local mapping = event.mapping
+    if not mapping then return end
+
+    local mapped_entities = mapping.get()
+    if not mapped_entities then return end
+
+    for bp_index, bp_entity in ipairs(entities) do
+        if bp_entity.name == GHOST_COMBINATOR then
+            local real_entity = mapped_entities[bp_index]
+
+            if real_entity and real_entity.valid then
+                local config = gc_config.serialize_config(real_entity)
+                if config then
+                    bp.set_blueprint_entity_tags(bp_index, {[gc_storage.CONFIG_TAG] = config})
+                end
+            end
+        end
+    end
+end
 
 return control
