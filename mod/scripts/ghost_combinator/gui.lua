@@ -139,9 +139,13 @@ function gui.create_gui(player, entity)
                 }
             },
             -- Content frame
+            -- `inside_shallow_frame` has no padding of its own, which left the
+            -- status row flush against the frame's top and left edges. The
+            -- _with_padding variant is the vanilla style for frame content
+            -- (padding = 12) and is what the rest of the mod family uses.
             {
                 type = "frame",
-                style = "inside_shallow_frame",
+                style = "inside_shallow_frame_with_padding",
                 direction = "vertical",
                 children = {
                     -- Status indicator
