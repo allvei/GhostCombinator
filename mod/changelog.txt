@@ -1,4 +1,24 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.1.0
+Date: 2026-09-03
+  Changes:
+    - The Ghost Combinator technology now requires Construction robotics and Circuit network
+      instead of Logistic system and Production science pack. These are the two things that
+      actually make the combinator useful - bots are what create ghosts, and wires are how you
+      read the output - and they unlock far earlier. Logistic system already requires utility
+      science in vanilla, and overhaul mods push it later still, so the combinator used to
+      arrive long after the point where it is most useful.
+    - Research cost is now derived from those two prerequisites: every science pack either of
+      them needs, at the higher amount, for the higher of their cycle counts and times. In
+      vanilla that is 100 cycles at 30s with automation, logistic and chemical science. This
+      replaces the placeholder cost of 5 cycles at 3s that shipped by mistake, so the
+      technology is no longer nearly free.
+    - The cost is recalculated after all other mods load, so overhaul mods that re-cost
+      Construction robotics or Circuit network carry this technology along with them.
+  Bug Fixes:
+    - The mod no longer fails to load if another mod removes one of its prerequisite
+      technologies.
+---------------------------------------------------------------------------------------------------
 Version: 1.0.0
 Date: 2026-08-15
   Features:

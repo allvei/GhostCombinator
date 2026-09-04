@@ -20,6 +20,7 @@ The governing split:
 |---|---|---|
 | `mod/control.lua` | `script.on_event` / `on_nth_tick` registration, event filters, dispatch to `scripts/*`, console commands | Business logic, storage reads/writes, prototype lookups |
 | `mod/data.lua` | Requiring prototype files in order | Anything runtime |
+| `mod/data-final-fixes.lua` | Requiring final-fixes prototype adjustments that must see other mods' final values | Anything runtime; defining new prototypes |
 | `lib/entity_lib.lua` | Ghost-aware entity identity: `get_name`, `is_type`, `is_ghost` | Storage access, mod-specific names |
 | `lib/circuit_utils.lua` | Reading/writing signals on a `LuaEntity`'s wire connectors, connection checks | Signal *table* math, storage, mod-specific entities |
 | `lib/signal_utils.lua` | Pure signal-table math (add/merge/copy/compare/count), signal keys, condition evaluation, prototype lookups (`signal_to_prototype`, `get_item_name_for_entity`) | Reading signals off entities (that's `circuit_utils`), storage |
@@ -31,6 +32,7 @@ The governing split:
 | `scripts/ghost_combinator/rescan.lua` | Rebuilding all counters from a full surface scan (`find_entities_filtered`), used by the version-change migration and `/gc-rescan` | Running on any routine path — it is a blocking whole-surface sweep |
 | `scripts/ghost_combinator/gui.lua` | Building/refreshing/closing the read-only ghost GUI, GUI event handling | Mutating ghost counts, registering events |
 | `prototypes/**` | Data-stage prototype definitions | Any `storage`/`game`/`script` reference |
+| `prototypes/technology/derive_cost.lua` | Recomputing the technology's `unit` from its prerequisites and pruning missing prerequisites, at final fixes | Defining prototypes; assuming vanilla values exist |
 
 ---
 
@@ -59,6 +61,9 @@ Start at 1 and take the first branch that matches.
 1. **Does it run in the data stage (defines a prototype)?**
    → `mod/prototypes/<category>/<entity>.lua`, and require it from `mod/data.lua`.
    Follow @docs/entity_creation_checklist.md.
+   If instead it *adjusts* an already-defined prototype and needs to observe what other
+   mods did to it, put it in `mod/prototypes/` and require it from
+   `mod/data-final-fixes.lua`, not `mod/data.lua`.
 
 2. **Is it a `script.on_event` / `on_nth_tick` / `commands.add_command` registration?**
    → `mod/control.lua`. The registration is one line that calls into a `scripts/` handler.

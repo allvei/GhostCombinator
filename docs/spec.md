@@ -16,13 +16,39 @@ against what still needs building.
 | Field | Value |
 |---|---|
 | Name | `ghost-combinator` |
-| Prerequisites | `logistic-system`, `production-science-pack` |
-| Science packs | automation, logistic, chemical, production, utility (1 each per cycle) |
+| Prerequisites | `construction-robotics`, `circuit-network` |
+| Science packs | automation, logistic, chemical (1 each per cycle) |
+| Cost | 100 cycles at 30s each |
 | Unlocks | `ghost-combinator` recipe |
 | Icon | `graphics/entities/ghost-combinator-icon.png` (64x64) |
 
-> ⚠️ **Known deviation:** the intended cost is 500 cycles at 30s each. The prototype currently
-> ships `count = 5, time = 3` (dev-testing values). Tracked in `docs/todo.md`.
+**Cost derivation:** the prerequisites are the two things that actually make the mod meaningful —
+construction bots (which is what creates ghosts) and the circuit network (which is how the output
+is read). `logistic-system` is deliberately avoided: in vanilla it already requires
+`utility-science-pack` (its prerequisites are `utility-science-pack` and `logistic-robotics`), and
+overhaul mods — Pyanodons especially — push it later still, which stranded this mod in the very
+late game. The research cost is
+the union of the two prerequisites' science pack types, each at the higher of the two amounts,
+with `count` and `time` likewise the higher of the two — verified against Factorio 2.1 base
+(`data/base/prototypes/technology.lua`): `construction-robotics` = 100 x 30s with
+automation/logistic/chemical, `circuit-network` = 100 x 15s with automation/logistic.
+
+Those literals in `prototypes/technology/technologies.lua` are only the vanilla fallback.
+`prototypes/technology/derive_cost.lua` re-applies the same rule in **data-final-fixes**, reading
+the prerequisites' final `unit` after every other mod has re-costed them, so an overhaul that
+makes `construction-robotics` cost 800 cycles of five pack types drags this technology along with
+it. On base + Space Age + Quality neither prerequisite is modified, so the pass is a no-op there.
+
+The prerequisite *list* is read as it stands at final fixes rather than from a hardcoded copy, so
+a mod that re-parents this technology is honoured rather than overwritten. The pass also drops any
+prerequisite naming a technology that no longer exists (a dangling prerequisite is a hard load
+error), omits any science pack that is not a `tool` prototype, and leaves the technology alone
+entirely if a mod converted it to `research_trigger`. Every failure path leaves the shipped
+literals in place.
+
+Limits: a mod whose own `data-final-fixes` runs after ours (because it does not depend on this
+mod) is not observed, and nothing in the data stage can react to runtime changes —
+`LuaTechnology.research_unit_count` is read-only.
 
 ### 2. Ghost Combinator Entity
 

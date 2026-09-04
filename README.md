@@ -8,7 +8,7 @@ Roboports tell you what items logistics bots are moving, but not what constructi
 
 ## Usage
 
-1. Research **Ghost Combinator** (requires Logistic System + Production Science)
+1. Research **Ghost Combinator** (requires Construction Robotics + Circuit Network)
 2. Build a Ghost Combinator anywhere on your base
 3. Connect red or green wire to read ghost counts
 4. Each ghost type outputs as a signal with its count

@@ -5,7 +5,9 @@ linked from here.
 
 ## Current Status
 
-Entity-ghost tracking is implemented end to end (v0.2.0) and ready for in-game testing.
+Shipped through v1.1.0. Entity ghosts, tile ghosts and upgrade requests are all tracked,
+with a per-combinator output mode selector. v1.1.0 re-gated the technology behind
+Construction robotics + Circuit network and derives its cost from those prerequisites.
 
 ## Completed
 
@@ -27,8 +29,6 @@ Entity-ghost tracking is implemented end to end (v0.2.0) and ready for in-game t
 ## Open Work
 
 ### Correctness
-- [ ] **Technology cost is dev values.** `prototypes/technology/technologies.lua` ships
-      `unit.count = 5, unit.time = 3`. Spec intent is 500 cycles at 30s. Decide and fix.
 - [ ] **Locale mod-name key mismatch.** `locale/en/ghost-combinator.cfg` has
       `[mod-name] mission-control=` / `[mod-description] mission-control=`, but `info.json`
       declares `name = "ghost-combinator"`, so neither string resolves. Rename both keys.
@@ -82,6 +82,13 @@ The combinator only counts `entity-ghost`. These are invisible to it today:
       absent, so `make lint` cannot run and nothing has been compiled. Static checks used
       instead: cross-module call resolution, and a block/delimiter balance pass. Install
       luacheck before trusting any of this in game.
+- [ ] **`.luacheckrc` has never been executed.** Added in v1.1.0 (the `Makefile` and `CLAUDE.md`
+      both referenced it, but the file did not exist, so `make lint` and `make ci` were dead even
+      with luacheck installed). It bans `global` outright to catch 1.1-isms, enables the
+      undefined-global codes 111/112/113 that the family config disables, and forbids `storage`
+      inside `mod/lib/` to enforce the stateless-lib rule. Expect to tune it on the first real
+      run. It exempts `mod/lib/gui_utils.lua` from 111/112/113 — see the global-functions item
+      under upstream fixes; delete that exemption once the base mod is fixed.
 
 ### Testing & Performance
 - [ ] Integration testing with blueprints (place/cancel large blueprints)

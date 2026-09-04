@@ -22,17 +22,34 @@ data:extend({
         icon_size = 64,  -- Standard icon size for technologies
 
         -- Technologies that must be researched before this one becomes available
-        -- logistic-system: Ensures player has basic logistics infrastructure
-        -- production-science-pack: Gates mid-game access
+        -- construction-robotics: ghosts only become a meaningful concept once
+        --   construction bots exist, so this is the true functional gate
+        -- circuit-network: the combinator's output is useless without wires
+        -- Deliberately NOT logistic-system: overhaul mods (Pyanodons in particular)
+        --   push it behind utility science, stranding this mod in the very late game
         prerequisites = {
-            "logistic-system",
-            "production-science-pack"
+            "construction-robotics",
+            "circuit-network"
         },
 
-        -- Research cost configuration
+        -- Research cost configuration.
+        -- Derived from the two prerequisites: the union of their science pack
+        -- types, each at the higher of the two amounts, and likewise for count
+        -- and time.
+        --
+        -- These literals are the VANILLA result and act as the fallback. They are
+        -- recomputed from the prerequisites' actual final values in
+        -- `prototypes/technology/derive_cost.lua` (data-final-fixes), so overhaul
+        -- mods that re-cost `construction-robotics` / `circuit-network` carry this
+        -- technology along with them. Edit the rule there, not just here.
+        --
+        -- Verified against Factorio 2.1 base (data/base/prototypes/technology.lua):
+        --   construction-robotics = 100 x 30s, automation/logistic/chemical 1 each
+        --   circuit-network       = 100 x 15s, automation/logistic 1 each
         unit = {
-            -- Number of research cycles required (500 cycles)
-            count = 5,
+            -- Number of research cycles required
+            -- max(100, 100)
+            count = 100,
 
             -- Science packs required per research cycle
             -- Each cycle consumes 1 of each pack listed below
@@ -40,14 +57,12 @@ data:extend({
             ingredients = {
                 {"automation-science-pack", 1},
                 {"logistic-science-pack", 1},
-                {"chemical-science-pack", 1},
-                {"production-science-pack", 1},
-                {"utility-science-pack", 1}
+                {"chemical-science-pack", 1}
             },
 
-            -- Time in ticks for each research cycle (60 ticks = 1 second)
-            -- This sets research time to 1 second per cycle
-            time = 3
+            -- Time in seconds for each research cycle
+            -- max(30, 15)
+            time = 30
         },
 
         -- Effects applied when technology is researched

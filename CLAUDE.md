@@ -54,12 +54,14 @@ docs/
 ├── todo.md                              # Development tracking (index of feature todos)
 ├── module_responsibility_matrix.md      # Code organization rules — READ BEFORE CODING
 ├── entity_creation_checklist.md         # Checklist for adding a new entity type
-└── flib_api_reference.md                # flib utility reference
+├── flib_api_reference.md                # flib utility reference
+└── construction_demand_tracking_todo.md # Feature plan: untracked construction demand
 mod/
 ├── info.json                            # Mod metadata (name, version, factorio_version)
 ├── changelog.txt                        # Factorio-format changelog
 ├── thumbnail.png                         # Mod portal thumbnail
 ├── data.lua                             # Data stage entry point
+├── data-final-fixes.lua                 # Final-fixes entry — runs after all other mods
 ├── control.lua                          # Runtime entry — event registration & routing only
 ├── lib/                                 # Stateless utility libraries (no storage access)
 │   ├── entity_lib.lua                   # Entity name / ghost helpers
@@ -73,6 +75,7 @@ mod/
 │   ├── globals.lua                      # Storage aggregator + shared player GUI state
 │   └── ghost_combinator/                # Entity-specific module
 │       ├── storage.lua                  # Per-category counters, slots, registrations, mode
+│       ├── config.lua                   # Per-instance combinator config (mode)
 │       ├── control.lua                  # Event handlers + tick/compaction/resync
 │       ├── rescan.lua                   # Full surface rescan (migration + /gc-rescan)
 │       └── gui.lua                      # Ghost count GUI + output mode selector
@@ -83,7 +86,9 @@ mod/
 │   ├── entity/ghost_combinator.lua      # Entity prototype
 │   ├── item/ghost_combinator.lua        # Item prototype
 │   ├── recipe/ghost_combinator.lua      # Recipe prototype
-│   └── technology/technologies.lua      # Technology definitions
+│   └── technology/
+│       ├── technologies.lua             # Technology definitions (vanilla fallback cost)
+│       └── derive_cost.lua              # Recomputes cost from prerequisites (final fixes)
 └── graphics/
     └── entities/
         ├── ghost-combinator.png         # Entity sprite (4-way spritesheet)
