@@ -55,7 +55,8 @@ docs/
 ├── module_responsibility_matrix.md      # Code organization rules — READ BEFORE CODING
 ├── entity_creation_checklist.md         # Checklist for adding a new entity type
 ├── flib_api_reference.md                # flib utility reference
-└── construction_demand_tracking_todo.md # Feature plan: untracked construction demand
+├── construction_demand_tracking_todo.md # Feature plan: untracked construction demand
+└── issue_fixes_todo.md                  # v1.2.0 plan: GitHub issues #1/#3/#4/#5
 mod/
 ├── info.json                            # Mod metadata (name, version, factorio_version)
 ├── changelog.txt                        # Factorio-format changelog
@@ -75,10 +76,11 @@ mod/
 │   ├── globals.lua                      # Storage aggregator + shared player GUI state
 │   └── ghost_combinator/                # Entity-specific module
 │       ├── storage.lua                  # Per-category counters, slots, registrations, mode
-│       ├── config.lua                   # Per-instance combinator config (mode)
+│       ├── config.lua                   # Per-instance combinator config (mode, network filter)
+│       ├── networks.lua                 # Per-logistic-network buckets + background re-bucket
 │       ├── control.lua                  # Event handlers + tick/compaction/resync
 │       ├── rescan.lua                   # Full surface rescan (migration + /gc-rescan)
-│       └── gui.lua                      # Ghost count GUI + output mode selector
+│       └── gui.lua                      # Ghost count GUI + mode selector + network filter
 ├── locale/
 │   └── en/
 │       └── ghost-combinator.cfg         # Localization strings
@@ -128,3 +130,9 @@ make ci           # check + lint
 make localdeploy  # copy mod/ into the local Factorio mods directory
 make package      # build dist/<name>_<version>.zip
 ```
+
+No Lua toolchain (and no `make`) on the Windows dev machine. For a syntax-only check, parse
+every file with `luaparse@0.3.1` via Node from a temp directory (use `npm.cmd`; PowerShell
+blocks `npm.ps1`). Validate `mod/changelog.txt` against
+https://lua-api.factorio.com/latest/auxiliary/changelog-format.html — one bad line hides the
+whole in-game changelog.

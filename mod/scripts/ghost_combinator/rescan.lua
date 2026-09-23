@@ -20,6 +20,7 @@
 -- because it is stateful and entity-specific.
 
 local gc_storage = require("scripts.ghost_combinator.storage")
+local gc_networks = require("scripts.ghost_combinator.networks")
 local signal_utils = require("lib.signal_utils")
 
 local rescan = {}
@@ -59,6 +60,9 @@ local function reset_surface_categories(surface_index)
         }
     end
 
+    -- Buckets are rebuilt alongside the categories by the scans below.
+    gc_networks.reset_surface(surface_data)
+
     return surface_data
 end
 
@@ -85,8 +89,11 @@ local function scan_ghosts(surface)
                 -- its EXISTING registration number, so this cannot create
                 -- duplicates for ghosts the previous version already tracked.
                 local registration_number = script.register_on_object_destroyed(ghost)
-                gc_storage.register_tracked_object(
+                local record = gc_storage.register_tracked_object(
                     registration_number, surface_index, category, item_name, quality_name)
+                if record then
+                    gc_networks.attach(record, ghost)
+                end
 
                 counted = counted + 1
             end
@@ -116,8 +123,11 @@ local function scan_upgrades(surface)
                 gc_storage.increment(surface_index, UPGRADE_CATEGORY, item_name, quality_name)
 
                 local registration_number = script.register_on_object_destroyed(entity)
-                gc_storage.register_tracked_object(
+                local record = gc_storage.register_tracked_object(
                     registration_number, surface_index, UPGRADE_CATEGORY, item_name, quality_name)
+                if record then
+                    gc_networks.attach(record, entity)
+                end
 
                 counted = counted + 1
             end
@@ -128,8 +138,9 @@ local function scan_upgrades(surface)
 end
 
 --- Discover every combinator on a surface and (re)register it
---- Preserves the mode of any combinator already known; anything newly discovered
---- gets DEFAULT_MODE ("builds"), which reproduces the pre-mode behavior exactly.
+--- Preserves the mode and network filter of any combinator already known;
+--- anything newly discovered gets DEFAULT_MODE ("builds") with the filter OFF,
+--- which reproduces the pre-1.2.0 behavior exactly.
 --- @param surface LuaSurface The surface to scan
 --- @param surface_data table The surface data table
 --- @return number Number of combinators registered
@@ -140,9 +151,11 @@ local function scan_combinators(surface, surface_data)
     -- get_surface_data normally upgrades those in place, but this must not
     -- depend on that having run.
     local existing_modes = {}
+    local existing_filters = {}
     for unit_number, record in pairs(surface_data.combinators) do
         if type(record) == "table" and record.mode then
             existing_modes[unit_number] = record.mode
+            existing_filters[unit_number] = record.network_filter == true
         end
     end
 
@@ -155,7 +168,10 @@ local function scan_combinators(surface, surface_data)
     for _, entity in pairs(combinators) do
         if entity.valid and entity.unit_number then
             local mode = existing_modes[entity.unit_number] or gc_storage.DEFAULT_MODE
-            if gc_storage.register_combinator(entity, mode) then
+            -- Explicit false, never nil: nil would apply DEFAULT_NETWORK_FILTER
+            -- (on) to a combinator built before the setting existed.
+            local network_filter = existing_filters[entity.unit_number] or false
+            if gc_storage.register_combinator(entity, mode, network_filter) then
                 counted = counted + 1
             end
         end

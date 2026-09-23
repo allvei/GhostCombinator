@@ -29,6 +29,8 @@ The governing split:
 | `scripts/globals.lua` | `init_storage()` aggregation, shared player GUI state, GUI cleanup on entity death | Entity-specific counting logic |
 | `scripts/ghost_combinator/storage.lua` | The `storage.ghost_combinator` and `storage.ghost_registrations` tables: surface data, increment/decrement, slot assignment, compaction, combinator registration | Writing to combinator control behaviors, GUI, event registration |
 | `scripts/ghost_combinator/control.lua` | Event handlers, writing ghost counts into combinator `LuaLogisticSection` slots, per-tick update, periodic compaction and full resync | Direct `script.on_event` calls, GUI element creation |
+| `scripts/ghost_combinator/networks.lua` | Per-logistic-network demand buckets (`surface_data.networks`), attaching/detaching tracked objects to the networks covering them, the background re-bucket (`storage.gc_rebucket`), combinator network lookup | Writing to control behaviors, GUI, event registration |
+| `scripts/ghost_combinator/config.lua` | Per-instance settings (mode, network filter) for real entities and ghosts; blueprint/paste/clone serialization | Demand counting, writing outputs |
 | `scripts/ghost_combinator/rescan.lua` | Rebuilding all counters from a full surface scan (`find_entities_filtered`), used by the version-change migration and `/gc-rescan` | Running on any routine path — it is a blocking whole-surface sweep |
 | `scripts/ghost_combinator/gui.lua` | Building/refreshing/closing the read-only ghost GUI, GUI event handling | Mutating ghost counts, registering events |
 | `prototypes/**` | Data-stage prototype definitions | Any `storage`/`game`/`script` reference |
@@ -43,7 +45,9 @@ Only `scripts/` modules touch `storage`. Each top-level key has exactly one owni
 | Storage key | Owner |
 |---|---|
 | `storage.ghost_combinator[surface_index]` | `scripts/ghost_combinator/storage.lua` |
-| `storage.ghost_registrations[registration_number]` | `scripts/ghost_combinator/storage.lua` |
+| `storage.ghost_registrations[registration_number]` | `scripts/ghost_combinator/storage.lua` (the `position`/`force`/`networks` fields: `networks.lua`) |
+| `storage.ghost_combinator[surface_index].networks` | `scripts/ghost_combinator/networks.lua` |
+| `storage.gc_rebucket` | `scripts/ghost_combinator/networks.lua` (initialized in `storage.lua`'s `init_storage`) |
 | `storage.player_gui_states[player_index]` | `scripts/globals.lua` |
 
 Other modules read this data only through the owning module's accessors
@@ -102,7 +106,9 @@ deconstruction orders) does **not** get its own `scripts/` directory — it feed
 combinator. Place the work as:
 
 - New event registrations → `mod/control.lua`
-- New handlers and the increment/decrement calls → `scripts/ghost_combinator/control.lua`
+- New handlers and the increment/decrement calls → `scripts/ghost_combinator/control.lua`.
+  Every new record must also go through `gc_networks.attach` after `register_tracked_object`,
+  and `gc_networks.detach` before it is discarded or overwritten, or network buckets drift.
 - Any new storage sub-table or key-namespacing → `scripts/ghost_combinator/storage.lua`
 - Prototype → item-name resolution for the new object kind (e.g. tile prototypes) →
   `lib/signal_utils.lua`, alongside `get_item_name_for_entity`

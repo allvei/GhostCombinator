@@ -8,6 +8,7 @@
 
 local gc_storage = require("scripts.ghost_combinator.storage")
 local gc_config = require("scripts.ghost_combinator.config")
+local gc_networks = require("scripts.ghost_combinator.networks")
 local globals = require("scripts.globals")
 local entity_lib = require("lib.entity_lib")
 local signal_utils = require("lib.signal_utils")
@@ -27,9 +28,42 @@ local GHOST_TYPE_CATEGORY = {
 
 local UPGRADE_CATEGORY = "upgrades"
 
+--- Stand-in entries table for a filtered combinator outside every network.
+--- Never written to.
+local NO_ENTRIES = {}
+
 -----------------------------------------------------------
 -- LOCAL HELPERS
 -----------------------------------------------------------
+
+--- Pick the CATEGORY a combinator record displays
+--- Unfiltered -> the surface-wide category. Filtered -> its network's bucket,
+--- or nil when it is outside every network (or nothing was counted there yet),
+--- which callers render as "output nothing".
+--- @param surface_data table The surface record
+--- @param record table The combinator record
+--- @return table|nil The CATEGORY table
+local function source_category(surface_data, record)
+    if record.network_filter then
+        return gc_networks.get_category(surface_data, record.network_id, record.mode)
+    end
+    return surface_data.categories[record.mode]
+end
+
+--- Check whether a combinator record displays a given category/bucket
+--- @param record table The combinator record
+--- @param category_name string The category name
+--- @param network_id number|nil The bucket's network id; nil = surface-wide
+--- @return boolean True if the combinator shows this category
+local function displays(record, category_name, network_id)
+    if record.mode ~= category_name then
+        return false
+    end
+    if network_id == nil then
+        return not record.network_filter
+    end
+    return record.network_filter == true and record.network_id == network_id
+end
 
 --- Get an entity's quality name, defaulting to "normal"
 --- @param entity LuaEntity The entity to read
@@ -148,8 +182,11 @@ local function track_ghost(entity)
     local quality_name = quality_of(entity)
 
     gc_storage.increment(surface_index, category, item_name, quality_name)
-    gc_storage.register_tracked_object(
+    local record = gc_storage.register_tracked_object(
         registration_number, surface_index, category, item_name, quality_name)
+    if record then
+        gc_networks.attach(record, entity)
+    end
 
     return true
 end
@@ -167,6 +204,20 @@ function control.on_ghost_built(event)
     end
 
     track_ghost(entity)
+end
+
+--- Handle an entity dying - count the ghost it left behind, if any
+--- A ghost created by death raises NO build event, so without this every
+--- entity destroyed by asteroids or biters is invisible (GitHub issue #4).
+--- Runs for every death on the map: the ghost check is the first line.
+--- @param event EventData.on_post_entity_died
+function control.on_post_entity_died(event)
+    local ghost = event.ghost
+    if not ghost or not ghost.valid then
+        return
+    end
+
+    track_ghost(ghost)
 end
 
 --- Handle a ghost being upgraded (upgrade planner dragged over ghosts)
@@ -227,6 +278,7 @@ function control.on_object_destroyed(event)
     gc_storage.unregister_tracked_object(registration_number)
 
     gc_storage.decrement(record.surface, record.category, record.item_name, record.quality)
+    gc_networks.detach(record)
 end
 
 -----------------------------------------------------------
@@ -255,6 +307,13 @@ function control.on_marked_for_upgrade(event)
     -- object returns the SAME number, so this both identifies an existing record
     -- and creates one we can attach to.
     local registration_number = script.register_on_object_destroyed(entity)
+
+    -- A re-mark overwrites this entity's record below. Pull the old demand out
+    -- of its network buckets first, or those buckets would leak one count.
+    local existing = gc_storage.get_tracked_object(registration_number)
+    if existing then
+        gc_networks.detach(existing)
+    end
 
     -- previous_target/previous_quality are set when the entity was ALREADY
     -- marked and is being re-marked at a different target. Undo the old demand
@@ -289,8 +348,11 @@ function control.on_marked_for_upgrade(event)
     gc_storage.increment(surface_index, UPGRADE_CATEGORY, item_name, quality_name)
 
     -- Overwrites this entity's own record in place rather than creating a second.
-    gc_storage.register_tracked_object(
+    local record = gc_storage.register_tracked_object(
         registration_number, surface_index, UPGRADE_CATEGORY, item_name, quality_name)
+    if record then
+        gc_networks.attach(record, entity)
+    end
 end
 
 --- Handle an upgrade order being cancelled
@@ -321,6 +383,7 @@ function control.on_cancelled_upgrade(event)
 
     gc_storage.unregister_tracked_object(registration_number)
     gc_storage.decrement(record.surface, record.category, record.item_name, record.quality)
+    gc_networks.detach(record)
 end
 
 -----------------------------------------------------------
@@ -354,16 +417,14 @@ function control.on_combinator_built(event)
         return
     end
 
-    -- Restore the mode from blueprint tags if the ghost carried one
+    -- Restore the config from blueprint tags if the ghost carried one
+    local tagged = tags and tags[gc_storage.CONFIG_TAG]
     local mode = gc_storage.DEFAULT_MODE
-    if tags and tags[gc_storage.CONFIG_TAG] and tags[gc_storage.CONFIG_TAG].mode then
-        local tagged_mode = tags[gc_storage.CONFIG_TAG].mode
-        if gc_storage.is_valid_mode(tagged_mode) then
-            mode = tagged_mode
-        end
+    if tagged and gc_storage.is_valid_mode(tagged.mode) then
+        mode = tagged.mode
     end
 
-    local record = gc_storage.register_combinator(entity, mode)
+    local record = gc_storage.register_combinator(entity, mode, gc_config.network_filter_from_config(tagged))
     if not record then
         log("[ghost_combinator] ERROR: Failed to register combinator")
         return
@@ -405,34 +466,102 @@ function control.on_combinator_removed(event)
     gc_storage.unregister_combinator(unit_number, entity.surface.index)
 end
 
---- Rewrite one combinator's output from scratch for a given mode
---- Called on placement and whenever the mode changes.
+--- Re-resolve a filtered combinator's network, caching it on the record
+--- @param record table The combinator record
+--- @return boolean True if the cached network id changed
+local function update_network_id(record)
+    if not record.network_filter then
+        return false
+    end
+
+    local network_id = gc_networks.find_combinator_network_id(record.entity)
+    if network_id == record.network_id then
+        return false
+    end
+
+    record.network_id = network_id
+    return true
+end
+
+--- Rewrite one combinator's output from scratch
+--- Called on placement and whenever the mode or network filter changes.
 --- @param entity LuaEntity The combinator entity
---- @param mode string|nil The mode to write (defaults to the entity's current mode)
+--- @param mode string|nil Unused; the record's mode is authoritative. Kept for callers.
 --- @return boolean True if the write succeeded
 function control.refresh_combinator(entity, mode)
     if not entity or not entity.valid then
         return false
     end
 
-    mode = mode or gc_config.get_mode(entity)
-
-    local surface_index = entity.surface.index
-    local category = gc_storage.get_category(surface_index, mode)
-    if not category then
+    local surface_data = gc_storage.get_surface_data(entity.surface.index)
+    local record = gc_storage.get_combinator_record(entity)
+    if not surface_data or not record then
         return false
     end
 
-    return write_all_slots(entity, category.entries)
+    update_network_id(record)
+
+    local category = source_category(surface_data, record)
+    return write_all_slots(entity, category and category.entries or NO_ENTRIES)
+end
+
+--- Get the entries a combinator (or its ghost) currently displays
+--- For the GUI. Mirrors source_category, but also works for ghosts and for
+--- combinators whose storage record is missing, by reading config directly.
+--- @param entity LuaEntity The combinator or combinator ghost
+--- @return table Entries table (key -> entry); empty if nothing to show
+function control.get_display_entries(entity)
+    if not entity or not entity.valid then
+        return NO_ENTRIES
+    end
+
+    local surface_data = gc_storage.get_surface_data(entity.surface.index)
+    if not surface_data then
+        return NO_ENTRIES
+    end
+
+    local mode = gc_config.get_mode(entity)
+    local category
+    if gc_config.get_network_filter(entity) then
+        local network_id = gc_networks.find_combinator_network_id(entity)
+        category = gc_networks.get_category(surface_data, network_id, mode)
+    else
+        category = surface_data.categories[mode]
+    end
+
+    return category and category.entries or NO_ENTRIES
 end
 
 -----------------------------------------------------------
 -- TICK HANDLERS
 -----------------------------------------------------------
 
+--- Clear a category's per-entry and category-level dirty flags
+--- @param category table A CATEGORY table
+local function clear_changed(category)
+    for _, entry in pairs(category.entries) do
+        entry.changed = false
+    end
+    category.dirty = false
+end
+
+--- Push a dirty category (surface-wide or network bucket) to its combinators
+--- Only clears flags when EVERY combinator took the update. If one failed,
+--- they stay set so the next tick retries.
+--- @param surface_data table The surface record
+--- @param category_name string The category name
+--- @param category table The CATEGORY table
+--- @param network_id number|nil The bucket's network id; nil = surface-wide
+local function flush_category(surface_data, category_name, category, network_id)
+    if category.dirty
+        and control.update_combinators_for_category(surface_data, category_name, category, network_id) then
+        clear_changed(category)
+    end
+end
+
 --- Per-tick incremental update
---- Walks each surface's categories and writes only the entries that changed,
---- and only to the combinators actually displaying that category.
+--- Walks each surface's categories and network buckets and writes only the
+--- entries that changed, and only to the combinators displaying them.
 --- @param event EventData.on_tick
 function control.on_tick(event)
     -- Pick up replacement ghosts created by an upgrade last tick
@@ -442,22 +571,19 @@ function control.on_tick(event)
         return
     end
 
-    for surface_index, surface_data in pairs(storage.ghost_combinator) do
+    for _, surface_data in pairs(storage.ghost_combinator) do
         local categories = surface_data.categories
         if categories then
             for category_name, category in pairs(categories) do
-                if category.dirty then
-                    local all_succeeded =
-                        control.update_combinators_for_category(surface_data, category_name, category)
+                flush_category(surface_data, category_name, category, nil)
+            end
+        end
 
-                    -- Only clear flags when EVERY combinator took the update.
-                    -- If one failed, keep them so the next tick retries.
-                    if all_succeeded then
-                        for _, entry in pairs(category.entries) do
-                            entry.changed = false
-                        end
-                        category.dirty = false
-                    end
+        local buckets = surface_data.networks
+        if buckets then
+            for network_id, bucket in pairs(buckets) do
+                for category_name, category in pairs(bucket.categories) do
+                    flush_category(surface_data, category_name, category, network_id)
                 end
             end
         end
@@ -468,8 +594,9 @@ end
 --- @param surface_data table The surface data table
 --- @param category_name string The category being updated
 --- @param category table The category record
+--- @param network_id number|nil The bucket's network id; nil = surface-wide
 --- @return boolean True if all matching combinators were updated
-function control.update_combinators_for_category(surface_data, category_name, category)
+function control.update_combinators_for_category(surface_data, category_name, category, network_id)
     local combinators = surface_data.combinators
     if not combinators then
         return true
@@ -482,7 +609,7 @@ function control.update_combinators_for_category(surface_data, category_name, ca
 
         if not entity or not entity.valid then
             combinators[unit_number] = nil
-        elseif record.mode == category_name then
+        elseif displays(record, category_name, network_id) then
             if not control.write_changed_slots(entity, category.entries) then
                 all_succeeded = false
             end
@@ -523,7 +650,47 @@ end
 -- PERIODIC COMPACTION
 -----------------------------------------------------------
 
---- Remove zero-count entries and close slot gaps, per category
+--- Compact one category (surface-wide or bucket) and rewrite its combinators
+--- @param surface_data table The surface record
+--- @param category_name string The category name
+--- @param category table The CATEGORY table
+--- @param network_id number|nil The bucket's network id; nil = surface-wide
+local function compact_and_rewrite(surface_data, category_name, category, network_id)
+    local removed = gc_storage.compact_category(category)
+
+    -- Compaction renumbers slots, so every combinator on this category must be
+    -- rewritten wholesale, not incrementally.
+    if removed == 0 then
+        return
+    end
+
+    local all_succeeded = true
+
+    for unit_number, record in pairs(surface_data.combinators) do
+        local entity = record and record.entity
+        if not entity or not entity.valid then
+            surface_data.combinators[unit_number] = nil
+        elseif displays(record, category_name, network_id) then
+            if not write_all_slots(entity, category.entries) then
+                all_succeeded = false
+            end
+        end
+    end
+
+    -- Clear the flags only if EVERY combinator took the rewrite, matching
+    -- on_tick. Clearing them after a partial failure would strand that
+    -- combinator with nothing left to re-mark it, leaving it stale until the
+    -- next full resync.
+    if all_succeeded then
+        clear_changed(category)
+    end
+
+    gc_storage.reset_category_high_water(category)
+end
+
+--- Remove zero-count entries and close slot gaps, per category and bucket
+--- Also drops network buckets left with no entries (networks that merged,
+--- split or were torn down).
 --- @param event EventData.on_nth_tick
 function control.compact_ghost_slots(event)
     if not storage.ghost_combinator then
@@ -536,36 +703,19 @@ function control.compact_ghost_slots(event)
         local categories = surface_data.categories
         if categories then
             for category_name, category in pairs(categories) do
-                local removed, old_max, new_max = gc_storage.compact_slots(surface_index, category_name)
+                compact_and_rewrite(surface_data, category_name, category, nil)
+            end
+        end
 
-                -- Compaction renumbers slots, so every combinator on this
-                -- category must be rewritten wholesale, not incrementally.
-                if removed > 0 then
-                    local all_succeeded = true
-
-                    for unit_number, record in pairs(surface_data.combinators) do
-                        local entity = record and record.entity
-                        if not entity or not entity.valid then
-                            surface_data.combinators[unit_number] = nil
-                        elseif record.mode == category_name then
-                            if not write_all_slots(entity, category.entries) then
-                                all_succeeded = false
-                            end
-                        end
-                    end
-
-                    -- Clear the flags only if EVERY combinator took the rewrite,
-                    -- matching on_tick. Clearing them after a partial failure
-                    -- would strand that combinator with nothing left to re-mark
-                    -- it, leaving it stale until the next full resync.
-                    if all_succeeded then
-                        for _, entry in pairs(category.entries) do
-                            entry.changed = false
-                        end
-                        category.dirty = false
-                    end
-
-                    gc_storage.reset_slot_high_water(surface_index, category_name)
+        local buckets = surface_data.networks
+        if buckets then
+            for network_id, bucket in pairs(buckets) do
+                for category_name, category in pairs(bucket.categories) do
+                    compact_and_rewrite(surface_data, category_name, category, network_id)
+                end
+                -- Assigning nil to the current key is legal during pairs().
+                if gc_networks.is_bucket_empty(bucket) then
+                    buckets[network_id] = nil
                 end
             end
         end
@@ -596,11 +746,13 @@ function control.full_resync_surface(surface_index, surface_data)
         if not entity or not entity.valid then
             combinators[unit_number] = nil
         else
-            local category = categories[record.mode]
-            if category then
-                if not write_all_slots(entity, category.entries) then
-                    all_succeeded = false
-                end
+            -- Resync is also where filtered combinators notice their network
+            -- changed id (roboports built/removed, networks merged or split).
+            update_network_id(record)
+
+            local category = source_category(surface_data, record)
+            if not write_all_slots(entity, category and category.entries or NO_ENTRIES) then
+                all_succeeded = false
             end
         end
     end
@@ -609,17 +761,30 @@ function control.full_resync_surface(surface_index, surface_data)
     -- exactly, so nothing needs rewriting on the next tick. Leaving the flags set
     -- would make the tick pass redundantly rewrite everything we just wrote.
     -- On partial failure the flags stay, so the next tick retries.
+    local buckets = surface_data.networks
+
     if all_succeeded then
         for _, category in pairs(categories) do
-            for _, entry in pairs(category.entries) do
-                entry.changed = false
+            clear_changed(category)
+        end
+        if buckets then
+            for _, bucket in pairs(buckets) do
+                for _, category in pairs(bucket.categories) do
+                    clear_changed(category)
+                end
             end
-            category.dirty = false
         end
     end
 
-    for category_name in pairs(categories) do
-        gc_storage.reset_slot_high_water(surface_index, category_name)
+    for _, category in pairs(categories) do
+        gc_storage.reset_category_high_water(category)
+    end
+    if buckets then
+        for _, bucket in pairs(buckets) do
+            for _, category in pairs(bucket.categories) do
+                gc_storage.reset_category_high_water(category)
+            end
+        end
     end
 end
 

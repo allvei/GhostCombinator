@@ -13,7 +13,15 @@
 --             upgrades = CATEGORY,  -- entities marked for upgrade
 --         },
 --         combinators = {
---             [unit_number] = { entity = LuaEntity, mode = "builds" },
+--             [unit_number] = {
+--                 entity         = LuaEntity,
+--                 mode           = "builds",
+--                 network_filter = true|nil,  -- nil/false = surface-wide (pre-1.2.0)
+--                 network_id     = N|nil,     -- cached; owned by networks.lua
+--             },
+--         },
+--         networks = {                         -- owned by networks.lua
+--             [network_id] = { categories = { builds = CATEGORY, ... } },
 --         },
 --         last_compact_tick = 0,
 --     }
@@ -52,6 +60,9 @@
 --         category  = "builds" | "tiles" | "upgrades",
 --         item_name = "iron-chest",  -- resolved at register time
 --         quality   = "normal",
+--         position  = {x, y},        -- set by networks.attach
+--         force     = force_index,   -- set by networks.attach
+--         networks  = {id, ...}|nil, -- network buckets this object is counted in
 --     }
 -- }
 -- Tracks objects registered with script.register_on_object_destroyed so the
@@ -87,6 +98,11 @@ local DEFAULT_MODE = "builds"
 gc_storage.DEFAULT_MODE = DEFAULT_MODE
 
 local VALID_MODES = {builds = true, tiles = true, upgrades = true}
+
+--- Network filter for NEWLY placed combinators. Existing combinators have no
+--- `network_filter` field, which reads as off, so an update never changes what
+--- an already-built combinator reports.
+gc_storage.DEFAULT_NETWORK_FILTER = true
 
 --- Check whether a string is a valid output mode
 --- @param mode string|nil The mode to validate
@@ -124,6 +140,7 @@ local function new_category()
         slot_high_water = 0
     }
 end
+gc_storage.new_category = new_category
 
 --------------------------------------------------------------------------------
 -- Storage Initialization
@@ -135,6 +152,9 @@ function gc_storage.init_storage()
     storage.ghost_combinator = storage.ghost_combinator or {}
     storage.ghost_registrations = storage.ghost_registrations or {}
     storage.pending_ghost_upgrades = storage.pending_ghost_upgrades or {}
+    -- Re-bucket cursor, owned by networks.lua. Initialized here so there is a
+    -- single init path reachable from globals.init_storage().
+    storage.gc_rebucket = storage.gc_rebucket or {keys = {}, index = 1, next_cycle_tick = 0}
 end
 
 --------------------------------------------------------------------------------
@@ -315,8 +335,10 @@ end
 --- in entity.tags instead (see save_ghost_config).
 --- @param entity LuaEntity The combinator entity to register
 --- @param mode string|nil Output mode; defaults to DEFAULT_MODE
+--- @param network_filter boolean|nil Network filter; nil keeps the existing value,
+---        or DEFAULT_NETWORK_FILTER for a combinator not registered before
 --- @return table|nil The combinator record, or nil if registration failed
-function gc_storage.register_combinator(entity, mode)
+function gc_storage.register_combinator(entity, mode, network_filter)
     if not entity or not entity.valid then
         log("[ghost_combinator] ERROR: Attempted to register invalid ghost combinator")
         return nil
@@ -355,9 +377,20 @@ function gc_storage.register_combinator(entity, mode)
         mode = (existing and existing.mode) or DEFAULT_MODE
     end
 
+    -- Same reasoning as mode: a re-register must not flip the player's choice.
+    if network_filter == nil then
+        if existing then
+            network_filter = existing.network_filter == true
+        else
+            network_filter = gc_storage.DEFAULT_NETWORK_FILTER
+        end
+    end
+
     local record = {
         entity = entity,
-        mode = mode
+        mode = mode,
+        network_filter = network_filter or nil,
+        network_id = existing and existing.network_id or nil
     }
     surface_data.combinators[unit_number] = record
 
@@ -443,6 +476,54 @@ local function entry_key(item_name, quality_name)
     return item_name .. ":" .. quality_name
 end
 
+--- Add one to an item's count in a CATEGORY table, assigning a slot if new
+--- Shared by the surface-wide categories and the per-network buckets.
+--- CRITICAL: hot path - no validation beyond what the caller cannot guarantee.
+--- @param cat table A CATEGORY table
+--- @param item_name string The resolved placing item name
+--- @param quality_name string|nil The quality name (defaults to "normal")
+function gc_storage.category_add(cat, item_name, quality_name)
+    quality_name = quality_name or "normal"
+    local key = entry_key(item_name, quality_name)
+    local entry = cat.entries[key]
+
+    if entry then
+        entry.count = entry.count + 1
+        entry.changed = true
+    else
+        local slot = cat.next_slot
+        cat.entries[key] = {
+            count = 1,
+            slot = slot,
+            changed = true,
+            item_name = item_name,
+            quality = quality_name
+        }
+        cat.next_slot = slot + 1
+
+        if slot > cat.slot_high_water then
+            cat.slot_high_water = slot
+        end
+    end
+
+    cat.dirty = true
+end
+
+--- Subtract one from an item's count in a CATEGORY table (floored at zero)
+--- Zero-count entries are left for compaction to remove.
+--- @param cat table A CATEGORY table
+--- @param item_name string The resolved placing item name
+--- @param quality_name string|nil The quality name (defaults to "normal")
+function gc_storage.category_remove(cat, item_name, quality_name)
+    local entry = cat.entries[entry_key(item_name, quality_name or "normal")]
+
+    if entry then
+        entry.count = math.max(0, entry.count - 1)
+        entry.changed = true
+        cat.dirty = true
+    end
+end
+
 --- Increment the demand count for an item in a category
 --- CRITICAL: Called for EVERY ghost built - must be FAST!
 --- The caller must have already resolved item_name via signal_utils; this
@@ -474,30 +555,7 @@ function gc_storage.increment(surface_index, category, item_name, quality_name)
         end
     end
 
-    quality_name = quality_name or "normal"
-    local key = entry_key(item_name, quality_name)
-    local entry = cat.entries[key]
-
-    if entry then
-        entry.count = entry.count + 1
-        entry.changed = true
-    else
-        local slot = cat.next_slot
-        cat.entries[key] = {
-            count = 1,
-            slot = slot,
-            changed = true,
-            item_name = item_name,
-            quality = quality_name
-        }
-        cat.next_slot = slot + 1
-
-        if slot > cat.slot_high_water then
-            cat.slot_high_water = slot
-        end
-    end
-
-    cat.dirty = true
+    gc_storage.category_add(cat, item_name, quality_name)
 end
 
 --- Decrement the demand count for an item in a category
@@ -520,14 +578,7 @@ function gc_storage.decrement(surface_index, category, item_name, quality_name)
         return
     end
 
-    quality_name = quality_name or "normal"
-    local entry = cat.entries[entry_key(item_name, quality_name)]
-
-    if entry then
-        entry.count = math.max(0, entry.count - 1)
-        entry.changed = true
-        cat.dirty = true
-    end
+    gc_storage.category_remove(cat, item_name, quality_name)
 end
 
 --- Get all entries for a category (for GUI display and output writing)
@@ -577,14 +628,11 @@ function gc_storage.clear_entry_changed(surface_index, category, key)
     end
 end
 
---- Reset a category's slot high-water mark after a full resync
---- @param surface_index number The surface index
---- @param category string One of CATEGORIES
-function gc_storage.reset_slot_high_water(surface_index, category)
-    local cat = gc_storage.get_category(surface_index, category)
-    if cat then
-        cat.slot_high_water = math.max(0, cat.next_slot - 1)
-    end
+--- Reset a CATEGORY table's slot high-water mark after a full resync
+--- Takes the table itself so it serves surface categories and network buckets.
+--- @param cat table A CATEGORY table
+function gc_storage.reset_category_high_water(cat)
+    cat.slot_high_water = math.max(0, cat.next_slot - 1)
 end
 
 --------------------------------------------------------------------------------
@@ -592,18 +640,13 @@ end
 --------------------------------------------------------------------------------
 
 --- Compact a category's slots - remove zero-count entries and close slot gaps
---- Called periodically to prevent slot fragmentation
---- @param surface_index number The surface index
---- @param category string One of CATEGORIES
+--- Called periodically to prevent slot fragmentation. Takes the table itself so
+--- it serves surface categories and network buckets alike.
+--- @param cat table A CATEGORY table
 --- @return number removed_count Number of entries removed
 --- @return number old_max_slot Maximum slot index before compaction
 --- @return number new_max_slot Maximum slot index after compaction
-function gc_storage.compact_slots(surface_index, category)
-    local cat = gc_storage.get_category(surface_index, category)
-    if not cat then
-        return 0, 0, 0
-    end
-
+function gc_storage.compact_category(cat)
     local old_max_slot = cat.next_slot - 1
 
     -- Collect zero-count entries (cannot remove while iterating)
@@ -675,9 +718,10 @@ end
 --- @param category string One of CATEGORIES
 --- @param item_name string The resolved placing item name
 --- @param quality_name string|nil The quality name
+--- @return table|nil The new record (callers attach network data to it), or nil if rejected
 function gc_storage.register_tracked_object(registration_number, surface_index, category, item_name, quality_name)
     if not registration_number or not item_name then
-        return
+        return nil
     end
 
     -- Reject malformed records. A record with a bad category stores fine but its
@@ -686,7 +730,7 @@ function gc_storage.register_tracked_object(registration_number, surface_index, 
     if not surface_index or not VALID_MODES[category] then
         log("[ghost_combinator] ERROR: register_tracked_object with invalid surface/category: "
             .. tostring(surface_index) .. "/" .. tostring(category))
-        return
+        return nil
     end
 
     if not storage.ghost_registrations then
@@ -705,12 +749,14 @@ function gc_storage.register_tracked_object(registration_number, surface_index, 
             tostring(existing.category)))
     end
 
-    storage.ghost_registrations[registration_number] = {
+    local record = {
         surface = surface_index,
         category = category,
         item_name = item_name,
         quality = quality_name or "normal"
     }
+    storage.ghost_registrations[registration_number] = record
+    return record
 end
 
 --- Look up a tracked object's registration record

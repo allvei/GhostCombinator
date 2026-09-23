@@ -7,6 +7,7 @@ local flib_gui = require("__flib__.gui")
 -- Entity modules
 local gc_control = require("scripts.ghost_combinator.control")
 local gc_gui = require("scripts.ghost_combinator.gui")
+local gc_networks = require("scripts.ghost_combinator.networks")
 local gc_rescan = require("scripts.ghost_combinator.rescan")
 local gc_storage = require("scripts.ghost_combinator.storage")
 local globals = require("scripts.globals")
@@ -20,6 +21,11 @@ local GHOST_COMBINATOR = "ghost-combinator"
 -- Periodic tick intervals (in ticks; 60 ticks = 1 second)
 local COMPACT_INTERVAL = 300   -- 5 seconds: remove zero-count ghosts & compress slots
 local RESYNC_INTERVAL  = 600   -- 10 seconds: full resync of combinator outputs from storage
+
+-- Background re-bucket of tracked demand into logistic networks (see
+-- scripts/ghost_combinator/networks.lua). Runs every tick in small batches.
+local REBUCKET_BATCH       = 50   -- tracked objects re-checked per tick
+local REBUCKET_CYCLE_TICKS = 300  -- 5 seconds: minimum time between full passes
 
 -- Register custom input handler for pipette tool on GUI signal buttons
 script.on_event("gui-pipette-signal", function(event)
@@ -161,6 +167,13 @@ script.on_event(defines.events.on_space_platform_mined_entity, on_entity_removed
 script.on_event(defines.events.on_entity_died, on_entity_removed)
 script.on_event(defines.events.script_raised_destroy, on_entity_removed)
 
+-- A ghost left behind by a dying entity raises no build event; this is the only
+-- place it can be seen. Unfiltered: no event filter selects "left a ghost", so
+-- the handler rejects on its first line.
+script.on_event(defines.events.on_post_entity_died, function(event)
+    gc_control.on_post_entity_died(event)
+end)
+
 -----------------------------------------------------------
 -- UPGRADE REQUEST TRACKING
 -- Unfiltered for the same reason as the build events: any entity on any
@@ -269,6 +282,8 @@ end)
 -- Every tick: Update combinator outputs if ghost counts changed
 -- CRITICAL: This must be fast! Only processes combinators on surfaces with changes
 script.on_event(defines.events.on_tick, function(event)
+    -- Re-bucket first so any moves it makes are flushed in the same tick.
+    gc_networks.rebucket_step(REBUCKET_BATCH, REBUCKET_CYCLE_TICKS, event.tick)
     gc_control.on_tick(event)
 end)
 
@@ -310,6 +325,10 @@ commands.add_command("gc-ghost-state", "Dumps the ghost combinator tracking stat
             for unit_number, record in pairs(surface_data.combinators) do
                 -- type check guards against legacy bare-entity records
                 local mode = (type(record) == "table" and record.mode) or "<legacy>"
+                -- Filtered combinators list as "<mode>@<network_id|none>"
+                if type(record) == "table" and record.network_filter then
+                    mode = mode .. "@" .. tostring(record.network_id or "none")
+                end
                 combinators_by_mode[mode] = combinators_by_mode[mode] or {}
                 table.insert(combinators_by_mode[mode], unit_number)
                 combinator_count = combinator_count + 1
@@ -334,12 +353,25 @@ commands.add_command("gc-ghost-state", "Dumps the ghost combinator tracking stat
             end
         end
 
+        -- Per-network bucket sizes: network_id -> {category -> entry count}
+        local networks = {}
+        if surface_data.networks then
+            for network_id, bucket in pairs(surface_data.networks) do
+                local sizes = {}
+                for category_name, category in pairs(bucket.categories) do
+                    sizes[category_name] = table_size(category.entries)
+                end
+                networks[network_id] = sizes
+            end
+        end
+
         summary[surface_name] = {
             surface_index = surface_index,
             combinator_count = combinator_count,
             combinators_by_mode = combinators_by_mode,
             last_compact_tick = surface_data.last_compact_tick,
-            categories = categories
+            categories = categories,
+            networks = networks
         }
     end
 
@@ -418,6 +450,9 @@ commands.add_command("gc-ghost-clear", "Clears ghost tracking data. Usage: /gc-g
                 category.dirty = true
             end
         end
+
+        -- Network buckets hold the same demand, split by network.
+        gc_networks.reset_surface(surface_data)
 
         return cleared
     end

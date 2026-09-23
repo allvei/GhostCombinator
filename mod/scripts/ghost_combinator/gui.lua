@@ -9,6 +9,7 @@ local entity_lib = require("lib.entity_lib")
 local globals = require("scripts.globals")
 local gc_storage = require("scripts.ghost_combinator.storage")
 local gc_config = require("scripts.ghost_combinator.config")
+local gc_networks = require("scripts.ghost_combinator.networks")
 -- Safe one-way dependency: control does not require gui, so there is no cycle.
 local gc_control = require("scripts.ghost_combinator.control")
 
@@ -23,6 +24,24 @@ local GUI_FRAME_NAME = "ghost_combinator_gui"
 -- GUI element name for the output mode selector
 local MODE_DROPDOWN_NAME = "ghost_combinator_mode_dropdown"
 
+-- GUI element name for the logistic network filter checkbox
+local NETWORK_CHECKBOX_NAME = "ghost_combinator_network_checkbox"
+
+--- Caption describing which network a combinator is counting
+--- @param entity LuaEntity The combinator or its ghost
+--- @return LocalisedString The caption
+local function network_status_caption(entity)
+    if not gc_config.get_network_filter(entity) then
+        return {"gui.ghost-combinator-network-surface"}
+    end
+
+    local network_id = gc_networks.find_combinator_network_id(entity)
+    if not network_id then
+        return {"gui.ghost-combinator-network-none"}
+    end
+    return {"gui.ghost-combinator-network-id", tostring(network_id)}
+end
+
 --- Build the localised captions for the mode dropdown, in CATEGORIES order
 --- @return table Array of LocalisedString captions
 local function mode_dropdown_items()
@@ -33,16 +52,16 @@ local function mode_dropdown_items()
     return items
 end
 
---- Convert one category's entries to the signal format the grid expects
---- Reads through the storage accessor rather than touching storage directly -
---- see docs/module_responsibility_matrix.md.
---- @param surface_index number The surface index
---- @param category string The category to display
+--- Convert the entries a combinator displays to the signal format the grid expects
+--- Reads through control's accessor rather than touching storage directly -
+--- see docs/module_responsibility_matrix.md. Honors the network filter, so the
+--- grid always matches the combinator's actual output.
+--- @param entity LuaEntity The combinator or its ghost
 --- @return table Array of signals in format {signal = SignalID, count = int}
-local function get_category_signals(surface_index, category)
+local function get_display_signals(entity)
     local signals = {}
 
-    local entries = gc_storage.get_entries(surface_index, category)
+    local entries = gc_control.get_display_entries(entity)
     if not entries then
         return signals
     end
@@ -68,9 +87,7 @@ local function create_signal_grid(parent, entity)
         return
     end
 
-    local surface_index = entity.surface.index
-    local mode = gc_config.get_mode(entity)
-    local signals = get_category_signals(surface_index, mode)
+    local signals = get_display_signals(entity)
 
     -- Use shared signal sub-grid from gui_circuit_inputs (no wire color for output display)
     return gui_circuit_inputs.create_signal_sub_grid(parent, signals, "none", "ghost_signal_grid")
@@ -233,6 +250,26 @@ function gui.create_gui(player, entity)
                                     minimal_width = 140
                                 }
                             }
+                        }
+                    },
+                    -- Logistic network filter
+                    {
+                        type = "checkbox",
+                        name = NETWORK_CHECKBOX_NAME,
+                        caption = {"gui.ghost-combinator-network-filter"},
+                        tooltip = {"gui.ghost-combinator-network-filter-tooltip"},
+                        state = gc_config.get_network_filter(entity),
+                        tags = { action = "set_network_filter" },
+                        style_mods = {
+                            bottom_margin = 4
+                        }
+                    },
+                    {
+                        type = "label",
+                        name = "network_status_label",
+                        caption = network_status_caption(entity),
+                        style_mods = {
+                            bottom_margin = 8
                         }
                     },
                     -- Signal section header
@@ -408,11 +445,34 @@ function gui.on_gui_closed(event)
     gui.close_gui(player)
 end
 
---- Handle GUI checkbox state changed event (stub - no checkboxes in this GUI)
+--- Handle GUI checkbox state changed event - the logistic network filter
 --- @param event EventData.on_gui_checked_state_changed
 function gui.on_gui_checked_state_changed(event)
-    -- Ghost combinator GUI has no checkboxes, this is a no-op
-    -- Kept for consistency with event registration in control.lua
+    local element = event.element
+    if not element or not element.valid then return end
+
+    local tags = element.tags
+    if not tags or tags.action ~= "set_network_filter" then return end
+
+    local player = game.get_player(event.player_index)
+    if not player then return end
+
+    local player_gui_state = globals.get_player_gui_state(player.index)
+    local entity = player_gui_state and player_gui_state.open_entity
+    if not entity or not entity.valid then
+        gui.close_gui(player)
+        return
+    end
+
+    if gc_config.set_network_filter(entity, element.state) then
+        -- The source table changes (surface-wide <-> network bucket), and slot
+        -- numbering differs between them, so rebuild the output wholesale.
+        if not entity_lib.is_ghost(entity) then
+            gc_control.refresh_combinator(entity)
+        end
+    end
+
+    gui.refresh_gui(player)
 end
 
 --- Handle dropdown selection changes - the output mode selector

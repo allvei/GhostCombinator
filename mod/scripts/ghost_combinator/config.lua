@@ -1,6 +1,12 @@
 -- Ghost Combinator - Per-Instance Config Module
--- Owns the combinator's output mode: reading and writing it, and moving it
--- across blueprints, copy-paste, cloning and ghost revival.
+-- Owns the combinator's settings - output mode and logistic network filter:
+-- reading and writing them, and moving them across blueprints, copy-paste,
+-- cloning and ghost revival.
+--
+-- NETWORK FILTER COMPATIBILITY: a config table that exists but has no
+-- `network_filter` field came from a pre-1.2.0 combinator, and reads as OFF so
+-- blueprints of old setups keep their old behavior. Only "no config at all"
+-- (a fresh combinator from the hand) gets DEFAULT_NETWORK_FILTER.
 --
 -- Split out of storage.lua purely for file size (CLAUDE.md caps modules at
 -- 750-900 lines); storage.lua owns the demand counters, this owns the
@@ -18,7 +24,7 @@
 -- storage lookup differs, because this mod keys combinators per surface rather
 -- than in one flat unit_number table.
 --
--- The config payload is a single string field, so the base mod's set<->array tag
+-- The config payload is flat scalars, so the base mod's set<->array tag
 -- conversion is not needed here.
 
 local entity_lib = require("lib.entity_lib")
@@ -32,6 +38,80 @@ local GHOST_COMBINATOR = "ghost-combinator"
 -- Re-exported from storage so callers have one place to look for the tag key
 local CONFIG_TAG = gc_storage.CONFIG_TAG
 local DEFAULT_MODE = gc_storage.DEFAULT_MODE
+
+--- Resolve the network filter a config table describes
+--- @param config table|nil A serialized config (blueprint tags, ghost tags, paste)
+--- @return boolean The network filter setting
+function gc_config.network_filter_from_config(config)
+    if config == nil then
+        return gc_storage.DEFAULT_NETWORK_FILTER
+    end
+    return config.network_filter == true
+end
+
+--------------------------------------------------------------------------------
+-- Network Filter (per-instance setting)
+--------------------------------------------------------------------------------
+
+--- Get whether a combinator only counts demand in its own logistic network
+--- Works for both real entities (storage) and ghosts (entity.tags)
+--- @param entity LuaEntity The combinator entity or its ghost
+--- @return boolean True if the network filter is on
+function gc_config.get_network_filter(entity)
+    if not entity or not entity.valid then
+        return false
+    end
+
+    if entity_lib.is_ghost(entity) then
+        local config = gc_config.get_ghost_config(entity)
+        return config ~= nil and config.network_filter == true
+    end
+
+    local record = gc_storage.get_combinator_record(entity)
+    return record ~= nil and record.network_filter == true
+end
+
+--- Set whether a combinator only counts demand in its own logistic network
+--- NOTE: Does NOT rewrite the combinator's output - the caller must call
+--- control.refresh_combinator, as with set_mode.
+--- @param entity LuaEntity The combinator entity or its ghost
+--- @param enabled boolean The new setting
+--- @return boolean True if the setting changed
+function gc_config.set_network_filter(entity, enabled)
+    if not entity or not entity.valid then
+        return false
+    end
+
+    enabled = enabled == true
+
+    if entity_lib.is_ghost(entity) then
+        if not entity_lib.is_type(entity, GHOST_COMBINATOR) then
+            return false
+        end
+
+        local config = gc_config.get_ghost_config(entity) or {mode = DEFAULT_MODE}
+        if config.network_filter == enabled then
+            return false
+        end
+        config.network_filter = enabled
+        gc_config.save_ghost_config(entity, config)
+        return true
+    end
+
+    local record = gc_storage.get_combinator_record(entity)
+    if not record then
+        return gc_storage.register_combinator(entity, nil, enabled) ~= nil
+    end
+
+    if (record.network_filter == true) == enabled then
+        return false
+    end
+
+    -- nil rather than false keeps unfiltered records identical to pre-1.2.0 ones
+    record.network_filter = enabled or nil
+    record.network_id = nil
+    return true
+end
 
 
 --------------------------------------------------------------------------------
@@ -151,7 +231,8 @@ function gc_config.serialize_config(entity)
     end
 
     return {
-        mode = gc_config.get_mode(entity)
+        mode = gc_config.get_mode(entity),
+        network_filter = gc_config.get_network_filter(entity)
     }
 end
 
@@ -177,20 +258,22 @@ function gc_config.restore_config(entity, config)
     if not gc_storage.is_valid_mode(mode) then
         mode = DEFAULT_MODE
     end
+    local network_filter = gc_config.network_filter_from_config(config)
 
     -- Handle ghosts - config lives in tags
     if entity_lib.is_ghost(entity) then
-        gc_config.save_ghost_config(entity, {mode = mode})
+        gc_config.save_ghost_config(entity, {mode = mode, network_filter = network_filter})
         return
     end
 
-    -- Real entity - ensure it is registered, then set the mode
+    -- Real entity - ensure it is registered, then apply the settings
     if not gc_storage.get_combinator_record(entity) then
-        gc_storage.register_combinator(entity, mode)
+        gc_storage.register_combinator(entity, mode, network_filter)
         return
     end
 
     gc_config.set_mode(entity, mode)
+    gc_config.set_network_filter(entity, network_filter)
 end
 
 --------------------------------------------------------------------------------
@@ -219,7 +302,7 @@ function gc_config.get_ghost_config(ghost_entity)
     local stored = tags and tags[CONFIG_TAG]
     if not stored then
         -- Default config
-        return {mode = DEFAULT_MODE}
+        return {mode = DEFAULT_MODE, network_filter = gc_storage.DEFAULT_NETWORK_FILTER}
     end
 
     local mode = stored.mode
@@ -227,7 +310,7 @@ function gc_config.get_ghost_config(ghost_entity)
         mode = DEFAULT_MODE
     end
 
-    return {mode = mode}
+    return {mode = mode, network_filter = gc_config.network_filter_from_config(stored)}
 end
 
 --- Save configuration to a ghost entity's tags
@@ -258,7 +341,7 @@ function gc_config.save_ghost_config(ghost_entity, config)
 
     -- Complete table replacement pattern for ghost tags
     local new_tags = ghost_entity.tags or {}
-    new_tags[CONFIG_TAG] = {mode = mode}
+    new_tags[CONFIG_TAG] = {mode = mode, network_filter = gc_config.network_filter_from_config(config)}
     ghost_entity.tags = new_tags
 end
 

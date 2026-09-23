@@ -76,9 +76,17 @@ that is not implementable on this prototype type.)
 
 ### 3. Configuration UI
 
-Read-only. The GUI shows the current ghost counts as a signal grid (reusing
-`lib/gui/gui_circuit_inputs.lua`) plus a status row. There is nothing for the player to
-configure — the combinator always reports its own surface.
+The GUI shows the current counts as a signal grid (reusing `lib/gui/gui_circuit_inputs.lua`)
+plus a status row, and two per-combinator settings. Both are stored on the combinator record
+(real entities) or in ghost tags, and survive blueprints, copy-paste and cloning:
+
+| Setting | Values | Default |
+|---|---|---|
+| Output mode | Builds (entity ghosts), Tiles (tile ghosts), Upgrades (upgrade requests) | Builds |
+| Only count ghosts in this logistic network | on / off | **on** for new combinators; **off** for combinators and blueprints from before 1.2.0 |
+
+A status line shows what is being counted: the whole surface, logistic network *N*, or nothing
+(filter on, but not inside any roboport's supply area).
 
 ## Signal Behavior
 
@@ -91,44 +99,63 @@ configure — the combinator always reports its own surface.
   report as `rail`.
 - Quality is always written explicitly; omitting it triggers a "non-trivial filter" error.
 - Tracking starts as soon as the mod is installed — **before** the technology is researched — so
-  a freshly built combinator immediately reflects existing ghosts.
+  a freshly built combinator immediately reflects existing ghosts. Adding the mod to an existing
+  save triggers a full rescan, so pre-existing ghosts are counted too.
+
+### Scope — surface vs. logistic network
+
+- **Filter off:** every tracked object on the combinator's surface, all forces.
+- **Filter on:** the combinator must stand inside the *supply* (logistic) area of a stationary
+  roboport. The network is found with `LuaSurface.find_logistic_network_by_position`, then one of
+  its cells must pass `is_in_logistic_range(position)`, with `mobile == false` and
+  `owner.type == "roboport"`. The closest cell is checked first, then all cells. Personal
+  roboports and non-roboport cells never qualify, so a filtered combinator on a space platform
+  outputs nothing. It counts objects whose position lies in that
+  network's *construction* area (`find_logistic_networks_by_construction_area`). An object covered
+  by several networks counts in each. Networks are per force, so only the combinator's force is
+  seen. Outside every network the combinator outputs nothing, so it can never request items no
+  robot can deliver (GitHub #5).
 
 ## Architecture
 
 ### Storage Structure
 
+The authoritative, field-by-field description lives at the top of
+`mod/scripts/ghost_combinator/storage.lua`. In outline:
+
 ```lua
 storage.ghost_combinator = {
   [surface_index] = {
-    combinators = { [unit_number] = LuaEntity },
-    ghosts = {
-      ["<item_name>:<quality>"] = {
-        count      = N,
-        slot       = M,          -- logistic section slot index
-        changed    = boolean,    -- dirty flag, drives incremental writes
-        item_name  = "iron-chest",
-        quality    = "normal",
-      },
-    },
-    any_changes      = boolean,  -- surface-level dirty flag
-    next_slot        = 1,
+    categories  = { builds = CATEGORY, tiles = CATEGORY, upgrades = CATEGORY },  -- surface-wide
+    networks    = { [network_id] = { categories = { builds = CATEGORY, ... } } }, -- per network
+    combinators = { [unit_number] = { entity, mode, network_filter, network_id } },
     last_compact_tick = 0,
-    slot_high_water  = 0,        -- highest slot ever used; bounds orphan clearing on resync
   },
 }
+-- CATEGORY = { entries = { ["<item>:<quality>"] = {count, slot, changed, item_name, quality} },
+--              dirty, next_slot, slot_high_water }
 
 storage.ghost_registrations = {
-  [registration_number] = { surface = idx, name = ghost_name, quality = quality_name },
+  [registration_number] = { surface, category, item_name, quality,
+                            position, force, networks = {network_id, ...} },
 }
 
+storage.gc_rebucket = { keys = {registration_number, ...}, index, next_cycle_tick }
+storage.pending_ghost_upgrades = { {surface, position}, ... }
 storage.player_gui_states = { [player_index] = { open_entity, gui_type, is_ghost } }
 ```
 
 ### Lifecycle
 
-**Increment** — `on_built_entity`, `on_robot_built_entity`, `script_raised_built`,
-`script_raised_revive`. Registered without filters (ghost tracking must see every entity), so
-the handler's first line is a `entity.type ~= "entity-ghost"` fast rejection.
+**Increment** — `on_built_entity`, `on_robot_built_entity`, `on_space_platform_built_entity`,
+`script_raised_built`, `script_raised_revive`, plus `on_post_entity_died` for the ghost a dying
+entity leaves behind (no build event is raised for it). Upgrade requests come from
+`on_marked_for_upgrade`. All registered without filters (tracking must see every entity), so each
+handler's first line is a fast rejection. Each new record is also added to the network buckets
+covering its position.
+
+Tiles destroyed by asteroids raise no event at all, so their tile ghosts are only found by a
+rescan.
 
 **Decrement** — every tracked ghost is registered with
 `script.register_on_object_destroyed()`, and `on_object_destroyed` drives the decrement. This is
@@ -139,9 +166,9 @@ ghost is **revived** into a real entity, which is the most common way a ghost di
 
 | Cadence | Work |
 |---|---|
-| Every tick | For each surface with `any_changes`, write only the `changed` slots. Dirty flags clear only if *every* combinator write succeeded, so a failure retries next tick. |
-| Every 300 ticks (5s) | Compact: drop zero-count entries, reassign slots to close gaps, clear orphaned slots above the new max. |
-| Every 600 ticks (10s) | Full resync: rewrite every slot from storage truth up to `slot_high_water`, clearing orphans. Safety net against desync from failed incremental writes. |
+| Every tick | Re-bucket 50 tracked objects against current network coverage (a full pass starts at most every 300 ticks, over a sorted snapshot of registration numbers for multiplayer determinism). Then, for each dirty category or network bucket, write only the `changed` slots to the combinators displaying it. Dirty flags clear only if *every* combinator write succeeded, so a failure retries next tick. |
+| Every 300 ticks (5s) | Compact categories and buckets: drop zero-count entries, reassign slots to close gaps, rewrite affected combinators. Drop empty buckets. |
+| Every 600 ticks (10s) | Full resync: re-resolve each filtered combinator's network, then rewrite every combinator from storage truth. Safety net against desync from failed incremental writes. |
 
 ### Performance Constraints
 
@@ -164,7 +191,8 @@ tick loop rather than per-ghost, gated by the `changed` / `any_changes` dirty fl
 
 | Command | Effect |
 |---|---|
-| `/gc-ghost-state` | Dump per-surface ghost counts, slot assignments, combinator count, registration count |
+| `/gc-ghost-state` | Dump per-surface counts, slot assignments, combinators by mode (filtered ones as `mode@network_id`), network bucket sizes, registration count |
+| `/gc-rescan` | Rebuild every counter and network bucket from a full surface scan |
 | `/gc-ghost-clear [surface_id]` | Clear tracking data for one surface, or all surfaces if omitted |
 
 ## Validation Checklist
@@ -195,14 +223,13 @@ tick loop rather than per-ghost, gated by the `changed` / `any_changes` dirty fl
 
 ## Known Limitations
 
-1. **Bootstrap** — ghosts that existed before the mod was installed are not tracked. There is no
-   startup scan.
+1. **Network coverage lag** — when roboports are built/removed, filtered combinators converge
+   over one background re-bucket cycle (a few seconds at ~10k tracked objects).
 2. **Signal type** — output is always `type = "item"`. An entity with no
    `items_to_place_this` falls back to its entity name, which may not resolve to a real item
    signal and can render as a placeholder icon.
-3. **Coverage** — only `entity-ghost` objects are counted. Upgrade requests, tile ghosts
-   (landfill, concrete, space platform foundation), and deconstruction orders are **not**
-   tracked. See `docs/todo.md`.
+3. **Coverage** — deconstruction orders are not tracked. Tile ghosts left by asteroid-destroyed
+   foundation are only found by `/gc-rescan`. See `docs/todo.md`.
 
 ## Final Notes
 

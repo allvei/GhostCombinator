@@ -1,16 +1,29 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.2.0
+Date: 2026-09-23
+  Features:
+    - New "Only count ghosts in this logistic network" option. When enabled, the combinator
+      must stand inside a roboport's supply area, and only reports demand inside the
+      construction area of that roboport's logistic network. Anywhere else it outputs
+      nothing. This stops requests for items no
+      robot can deliver. On by default for newly placed combinators. Existing combinators and
+      blueprints made before this version keep reporting the whole surface.
+  Bugfixes:
+    - Ghosts left behind when an entity is destroyed are now counted.
+    - Fixed the changelog not being shown in the in-game mod browser.
+---------------------------------------------------------------------------------------------------
 Version: 1.1.0
 Date: 2026-09-03
   Changes:
-    - In response to user requests, Ghost Combinator technology now requires Construction robotics 
-      and Circuit network instead of Logistic system and Production science pack. The combinator 
-      is avaialble earlier.
+    - In response to user requests, Ghost Combinator technology now requires Construction robotics
+      and Circuit network instead of Logistic system and Production science pack. The combinator
+      is available earlier.
     - Research cost is now derived from those two prerequisites: every science pack either of
       them needs, at the higher amount, for the higher of their cycle counts
       and times. The cost is recalculated after all other mods load, so overhaul mods that re-cost
       Construction robotics or Circuit network should carry this technology along with them.
-  Bug Fixes:
-    - The combinator window has had padding add
+  Bugfixes:
+    - Added missing padding to the combinator window.
     - The mod no longer fails to load if another mod removes one of its prerequisite
       technologies.
 ---------------------------------------------------------------------------------------------------
@@ -24,7 +37,7 @@ Date: 2026-08-15
     - Tile ghosts are now tracked: landfill, concrete and its variants, stone brick, space
       platform foundation, and the Space Age soils.
     - Upgrade requests are now tracked, reported as the target item.
-  Bug Fixes:
+  Bugfixes:
     - Combinators built by a space platform were never registered and output nothing.
     - Entities whose placing item differs from their name reported an invalid signal
       (stone brick tiles reported "stone-path", which is not an item).
@@ -37,30 +50,30 @@ Date: 2026-08-15
 ---------------------------------------------------------------------------------------------------
 Version: 0.2.0
 Date: 2026-08-03
-  Update
+  Compatibility:
     - Update to 2.1
 ---------------------------------------------------------------------------------------------------
 Version: 0.1.4
 Date: 2026-02-22
-  Bug Fixes:
-    - Periodic resync underlying constant combinator.  
-    - Tighten the race conditions causing sync issues. Testing race conditions can be hard, 
+  Bugfixes:
+    - Periodic resync underlying constant combinator.
+    - Tighten the race conditions causing sync issues. Testing race conditions can be hard,
       so please comment if you see issues.
 ---------------------------------------------------------------------------------------------------
 Version: 0.1.3
 Date: 2025-12-18
-  Internal update:
+  Modding:
     - synced library functions for consideration of pulling out into shared mod
 ---------------------------------------------------------------------------------------------------
 Version: 0.1.2
 Date: 2025-11-29
-  Packaging Changes:
+  Info:
     - Added changelog.txt for mod website
     - Fixed typo in thumbnail file name
 ---------------------------------------------------------------------------------------------------
 Version: 0.1.1
-Date: 2025-11-226
-  Packaging Changes:
+Date: 2025-11-26
+  Info:
     - Added thumbnail.png for mod website
 ---------------------------------------------------------------------------------------------------
 Version: 0.1.0

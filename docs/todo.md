@@ -5,9 +5,13 @@ linked from here.
 
 ## Current Status
 
-Shipped through v1.1.0. Entity ghosts, tile ghosts and upgrade requests are all tracked,
-with a per-combinator output mode selector. v1.1.0 re-gated the technology behind
+Shipped through v1.1.0; v1.2.0 in progress. Entity ghosts, tile ghosts and upgrade requests are
+all tracked, with a per-combinator output mode selector. v1.1.0 re-gated the technology behind
 Construction robotics + Circuit network and derives its cost from those prerequisites.
+
+v1.2.0 fixes GitHub issues #3 (in-game changelog), #4 (ghosts left by destroyed entities) and #5
+(per-logistic-network filter); #1 was already fixed in 1.0.0.
+**Plan: [docs/issue_fixes_todo.md](issue_fixes_todo.md)** — awaiting in-game test.
 
 ## Completed
 
@@ -44,20 +48,21 @@ Construction robotics + Circuit network and derives its cost from those prerequi
       Delete or port. Detail in the feature plan, §8.
 
 ### Coverage — untracked construction demand
-The combinator only counts `entity-ghost`. These are invisible to it today:
-- [ ] Upgrade requests (`on_marked_for_upgrade` / `on_cancelled_upgrade`)
-- [ ] Tile ghosts (`type == "tile-ghost"`) — landfill, all concrete variants, stone brick,
-      space platform foundation, and the Space Age soils/platforms
+Originally the combinator only counted `entity-ghost`:
+- [x] Upgrade requests (`on_marked_for_upgrade` / `on_cancelled_upgrade`) — 1.0.0
+- [x] Tile ghosts (`type == "tile-ghost"`) — landfill, all concrete variants, stone brick,
+      space platform foundation, and the Space Age soils/platforms — 1.0.0
 - [ ] Deconstruction orders — out of scope for now; they *produce* items rather than requiring
       them, so they'd invert the meaning of the signal
 
 **Feature plan: [docs/construction_demand_tracking_todo.md](construction_demand_tracking_todo.md)**
 (APIs verified against Factorio 2.1.14 / api_version 6)
 
-### Space platform events — likely bug
-- [ ] `mod/control.lua` never registers `on_space_platform_built_entity` or
-      `on_space_platform_mined_entity`. A ghost combinator built by a space platform is never
-      registered in storage and outputs nothing. Details in the feature plan above, §4.
+### Space platform events
+- [x] `on_space_platform_built_entity` / `on_space_platform_mined_entity` registered (1.0.0).
+- [x] Ghosts left by destroyed entities (asteroids) tracked via `on_post_entity_died` (1.2.0, #4).
+- [ ] Foundation tiles destroyed by asteroids raise no event; their tile ghosts are only picked up
+      by `/gc-rescan`.
 
 ### Upstream fixes for `../FactorioBaseMod` (affect the whole mod family)
 - [ ] **`lib/gui_utils.lua:134` uses `utility/close_white`, which does not exist in Factorio 2.x.**
@@ -99,7 +104,7 @@ The combinator only counts `entity-ghost`. These are invisible to it today:
 
 ## Known Limitations
 
-1. **Bootstrap** — ghosts placed before the mod was installed are never counted; there is no
-   startup scan of existing ghosts.
+1. **Network re-bucket lag** — when roboport coverage changes, filtered combinators converge over
+   one background re-bucket cycle rather than instantly (see `docs/issue_fixes_todo.md`).
 2. **Signal type** — output is always `type = "item"`. Entities without `items_to_place_this`
    fall back to their entity name, which may not be a valid item signal.
