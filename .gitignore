@@ -1,0 +1,7 @@
+CLAUDE.md
+docs/
+Makefile
+.luacheckrc
+mod/build.py
+*.zip
+dist/
