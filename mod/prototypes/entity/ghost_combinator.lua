@@ -45,7 +45,7 @@ ghost_combinator.sprites = make_4way_animation_from_spritesheet({
         -- Main sprite layer (custom ghost combinator graphics)
         {
             scale = 0.5,
-            filename = "__ghost-combinator__/graphics/entities/ghost-combinator.png",
+            filename = "__updated-ghost-combinator__/graphics/entities/ghost-combinator.png",
             width = 114,
             height = 102,
             shift = util.by_pixel(0, 5)

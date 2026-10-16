@@ -18,7 +18,7 @@ data:extend({
         -- Technology icon displayed in the research queue
         -- Custom ghost combinator icon
         -- icon_size MUST be specified when using icon (Factorio 2.0 requirement)
-        icon = "__ghost-combinator__/graphics/entities/ghost-combinator-icon.png",
+        icon = "__updated-ghost-combinator__/graphics/entities/ghost-combinator-icon.png",
         icon_size = 64,  -- Standard icon size for technologies
 
         -- Technologies that must be researched before this one becomes available

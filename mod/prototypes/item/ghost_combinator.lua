@@ -6,7 +6,7 @@ data:extend({
         type = "item",
         name = "ghost-combinator",
         -- Custom ghost combinator icon
-        icon = "__ghost-combinator__/graphics/entities/ghost-combinator-icon.png",
+        icon = "__updated-ghost-combinator__/graphics/entities/ghost-combinator-icon.png",
         icon_size = 64,
         -- Place in circuit network category
         subgroup = "circuit-network",

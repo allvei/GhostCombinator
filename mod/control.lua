@@ -76,7 +76,7 @@ script.on_configuration_changed(function(data)
     -- Gated on our own mod entry so unrelated mod updates in the same save do
     -- not pay the cost. Every combinator it finds is assigned the default
     -- "builds" mode, which reproduces the pre-mode behavior exactly.
-    if data and data.mod_changes and data.mod_changes["ghost-combinator"] then
+    if data and data.mod_changes and data.mod_changes["updated-ghost-combinator"] then
         gc_rescan.rescan_all()
         -- Rescan rebuilds storage only. Combinator sections still hold their old
         -- slots, and the incremental tick pass cannot clear them, so repaint
